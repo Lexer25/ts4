@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>dotnet-TS4-54869e89-5562-4c18-85cf-84a78ae9ec5f</UserSecretsId>
+    <DockerDefaultTargetOS>Windows</DockerDefaultTargetOS>
+    <Platforms>AnyCPU;x86</Platforms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FirebirdSql.Data.FirebirdClient" Version="10.3.2" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Microsoft.VisualStudio.Azure.Containers.Tools.Targets" Version="1.21.0" />
+	<PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
+	<PackageReference Include="Serilog.Extensions.Logging.File" Version="3.0.0" />
+	<PackageReference Include="System.Data.Odbc" Version="9.0.3" />
+	<PackageReference Include="System.Data.OleDb" Version="9.0.3" />
+  </ItemGroup>
+</Project>
