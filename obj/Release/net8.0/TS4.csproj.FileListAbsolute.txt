@@ -66,3 +66,4 @@ C:\Users\Veshsh\source\repos\TS4\TS4\obj\Release\net8.0\refint\TS4.dll
 C:\Users\Veshsh\source\repos\TS4\TS4\obj\Release\net8.0\TS4.pdb
 C:\Users\Veshsh\source\repos\TS4\TS4\obj\Release\net8.0\TS4.genruntimeconfig.cache
 C:\Users\Veshsh\source\repos\TS4\TS4\obj\Release\net8.0\ref\TS4.dll
+C:\Users\Veshsh\source\repos\TS4\TS4\obj\Release\net8.0\TS4.sourcelink.json
