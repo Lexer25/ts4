@@ -60,3 +60,4 @@ C:\Users\Veshsh\source\repos\TS4\TS4\obj\Release\net8.0\win-x86\refint\TS4.dll
 C:\Users\Veshsh\source\repos\TS4\TS4\obj\Release\net8.0\win-x86\TS4.pdb
 C:\Users\Veshsh\source\repos\TS4\TS4\obj\Release\net8.0\win-x86\TS4.genruntimeconfig.cache
 C:\Users\Veshsh\source\repos\TS4\TS4\obj\Release\net8.0\win-x86\ref\TS4.dll
+C:\Users\Veshsh\source\repos\TS4\TS4\obj\Release\net8.0\win-x86\TS4.sourcelink.json

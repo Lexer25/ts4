@@ -31,11 +31,11 @@ namespace TS4
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            logger.LogTrace(@$"time run basip: {timestart} deltasleep: {deltasleep}");
+            logger.LogDebug(@$"time run basip: {timestart} deltasleep: {deltasleep}");
             await Task.Delay(deltasleep);
             while (!stoppingToken.IsCancellationRequested)
             {
-                logger.LogTrace($@"Старт итерации");
+                logger.LogDebug($@"Старт итерации");
                 try
                 {
                    run();
@@ -200,7 +200,7 @@ namespace TS4
             con.Close();//закрыл подключение к БД СКУД
             //lineStat += "|conClose:" + (DateTime.Now - _start);
 
-            logger.LogDebug("223  " + lineStat + "|Time_execute:" + (DateTime.Now - start));
+            logger.LogTrace("223  " + lineStat + "|Time_execute:" + (DateTime.Now - start));
         }
 
 
@@ -226,7 +226,7 @@ namespace TS4
                 return;
             }
             //Console.WriteLine(@$"281 sql GetComandForDevice_{DateTime.Now - start}");
-            logger.LogDebug(@$"281 sql GetComandForDevice name= {dev.controllerName} count {table.Rows.Count} time_exec:{DateTime.Now - start}");
+            logger.LogTrace(@$"281 sql GetComandForDevice name= {dev.controllerName} count {table.Rows.Count} time_exec:{DateTime.Now - start}");
             start = DateTime.Now;
 
             //собираю команды в один список cmds: на входе массив данных из БД, на выходе - массив строк с готовыми командами.
@@ -239,17 +239,18 @@ namespace TS4
 
             }
 
-            logger.LogDebug(@$"258 Для name = {dev.controllerName} имеется {cmds.Count()} команд записи/удаления");
+            logger.LogTrace(@$"258 Для name = {dev.controllerName} имеется {cmds.Count()} команд записи/удаления");
 
             //а теперь обрабаываю список команд cmds
             foreach (Command cmd in cmds)
             {
                 string answer = "";
                 // anser = com.ComandExclude(cmd.command);//выполнил команду
+                logger.LogDebug($@"Command destination: {((int)cmd.dataRow["operation"] == 1 ? "AddCard " : "DeleteCard")} id_dev={cmd.dataRow["id_dev"]} Command: {cmd.command}");
                 answer = com.ComandExecute(cmd.command);//выполнил команду
                 AfterComand(answer, con, cmd.dataRow);//зафиксировал результат в базе данных
-                string log = $@"288 name={dev.controllerName}  | reader  {cmd.dataRow["id_reader"]} | IP {dev.ip} | {cmd.command} > {answer}";
-                logger.LogDebug(log);//зафиксировал результат в лог-файле
+                logger.LogDebug($@"Answer destination:  {((int)cmd.dataRow["operation"] == 1 ? "AddCard " : "DeleteCard")} id_dev={cmd.dataRow["id_dev"]}  
+                name={dev.controllerName} reader={cmd.dataRow["id_reader"]} IP={dev.ip} Command: {cmd.command} Answer: {answer}");
             }
 
         }
