@@ -21,36 +21,7 @@ namespace TS4
             return new FbConnection(connectionString);
         }
 
-        /** Список всех записей из таблицы cardindev
-         * 
-         * 
-         */
-        /*
-        public static DataTable cardInDevGetList(FbConnection con)
-        {
-            //string sql = @$"select * from {procd}";
-            string sql = @$"select * from cardindev";
-            FbCommand getip = new FbCommand(sql, con);
-            var reader = getip.ExecuteReader();
-            DataTable table = new DataTable();
-            table.Load(reader);
-            return table;
-        }
-        */
-        /** Список контроллеров, куда надо будет загружать карты
-         * 
-         */
-
-
-        /** Список всех контроллеров.
-         * 
-         */
-
-
-
-        /**Получаю список команд загрузки для указанного контроллера.
-         * input id - контроллер!!!
-         */
+       
         public static bool ProcedurChec(FbConnection con)
         {
             string sql = "select distinct * from RDB$PROCEDURES where RDB$PROCEDURE_name='CARDINDEV_TS4'";

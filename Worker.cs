@@ -195,12 +195,6 @@ namespace TS4
                 lineStat += "|DevConnectNo:";
 
 
-                //  DB.UpdateIdxCardsNoConnect(con, dev.id); //зафиксировал no connect
-
-                //lineStat += "|UpdateIdxCardsNoConnect:" + (DateTime.Now - _start);
-                //  DB.UpdateCardInDevIncrements(con, dev.id);//attempt+1
-
-                //lineStat += "|UpdateCardInDevIncrements:" + (DateTime.Now - _start);
 
             }
             con.Close();//закрыл подключение к БД СКУД
