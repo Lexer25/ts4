@@ -229,7 +229,7 @@ namespace TS4
             logger.LogDebug(@$"281 sql GetComandForDevice name= {dev.controllerName} count {table.Rows.Count} time_exec:{DateTime.Now - start}");
             start = DateTime.Now;
 
-            //собираю команды в один список cmds
+            //собираю команды в один список cmds: на входе массив данных из Ѕƒ, на выходе - массив строк с готовыми командами.
             List<Command> cmds = new List<Command>();
             foreach (DataRow row in table.Rows)
             {
