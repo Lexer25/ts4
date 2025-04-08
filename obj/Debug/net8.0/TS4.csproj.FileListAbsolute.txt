@@ -126,3 +126,13 @@ D:\source\repos\TS4\obj\Debug\net8.0\refint\TS4.dll
 D:\source\repos\TS4\obj\Debug\net8.0\TS4.pdb
 D:\source\repos\TS4\obj\Debug\net8.0\TS4.genruntimeconfig.cache
 D:\source\repos\TS4\obj\Debug\net8.0\ref\TS4.dll
+C:\Users\Veshsh\source\repos\TS4\TS4\bin\Debug\net8.0\System.Configuration.ConfigurationManager.dll
+C:\Users\Veshsh\source\repos\TS4\TS4\bin\Debug\net8.0\System.Data.Odbc.dll
+C:\Users\Veshsh\source\repos\TS4\TS4\bin\Debug\net8.0\System.Data.OleDb.dll
+C:\Users\Veshsh\source\repos\TS4\TS4\bin\Debug\net8.0\System.Diagnostics.PerformanceCounter.dll
+C:\Users\Veshsh\source\repos\TS4\TS4\bin\Debug\net8.0\System.Security.Cryptography.ProtectedData.dll
+C:\Users\Veshsh\source\repos\TS4\TS4\bin\Debug\net8.0\runtimes\unix\lib\net8.0\System.Data.Odbc.dll
+C:\Users\Veshsh\source\repos\TS4\TS4\bin\Debug\net8.0\runtimes\win\lib\net8.0\System.Data.Odbc.dll
+C:\Users\Veshsh\source\repos\TS4\TS4\bin\Debug\net8.0\runtimes\win\lib\net8.0\System.Data.OleDb.dll
+C:\Users\Veshsh\source\repos\TS4\TS4\bin\Debug\net8.0\runtimes\win\lib\net8.0\System.Diagnostics.PerformanceCounter.dll
+C:\Users\Veshsh\source\repos\TS4\TS4\obj\Debug\net8.0\TS4.sourcelink.json

@@ -42,8 +42,8 @@ namespace TS4
                 }
                 catch (Exception ex)
                 {
-                    logger.LogError("Something crash restart everything");
-                    logger.LogError(ex.ToString());
+                    logger.LogError("45 Something crash restart everything");
+                    logger.LogDebug("46 "+ex.ToString());
                     continue;
                 }
                 logger.LogTrace($@"timeout basip: {timeout}");
@@ -130,7 +130,16 @@ namespace TS4
             {
                 //MainLine(dev,_logger, db_config);
                 // Thread thread = new Thread(() => GetVersion(dev));
-                Thread thread = new Thread(() => MainLine(dev, options.Firebird_db_config));
+                Thread thread = new Thread(() => {
+                try {
+                        MainLine(dev, options.Firebird_db_config);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError($@"139 Поток девайса с ip {dev.ip} name {dev.controllerName} обрыв подключение к БД СКУД");
+                        logger.LogDebug("140 "+ex.ToString());
+                    }
+                });
                 threads.Add(thread);
                 thread.Start();
                // tasks.Add(MainLine(dev, logger, options.Firebird_db_config));

@@ -12,6 +12,7 @@ namespace TS4
     {
         public static OleDbConnection Connect(string connectionString)
         {
+            Console.WriteLine(connectionString);
             return new OleDbConnection(connectionString);
         }
         public static DataTable GetDevice(OleDbConnection con)
