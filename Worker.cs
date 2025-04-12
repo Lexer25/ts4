@@ -255,11 +255,10 @@ namespace TS4
             {
                 string answer = "";
                 // anser = com.ComandExclude(cmd.command);//выполнил команду
-                logger.LogDebug($@"Command destination: {((int)cmd.dataRow["operation"] == 1 ? "AddCard " : "DeleteCard")} id_dev={cmd.dataRow["id_dev"]} Command: {cmd.command}");
+                //logger.LogDebug($@"Command destination: {((int)cmd.dataRow["operation"] == 1 ? "AddCard " : "DeleteCard")} id_dev={cmd.dataRow["id_dev"]} Command: {cmd.command}");
                 answer = com.ComandExecute(cmd.command);//выполнил команду
                 AfterComand(answer, con, cmd.dataRow);//зафиксировал результат в базе данных
-                logger.LogDebug($@"Answer destination:  {((int)cmd.dataRow["operation"] == 1 ? "AddCard " : "DeleteCard")} id_dev={cmd.dataRow["id_dev"]}  
-                name={dev.controllerName} reader={cmd.dataRow["id_reader"]} IP={dev.ip} Command: {cmd.command} Answer: {answer}");
+                logger.LogCritical($@"Answer destination:  {((int)cmd.dataRow["operation"] == 1 ? "AddCard " : "DeleteCard")} id_dev={cmd.dataRow["id_dev"]} name={dev.controllerName} reader={cmd.dataRow["id_reader"]} IP={dev.ip} Command: {cmd.command} Answer: {answer}");
             }
 
         }

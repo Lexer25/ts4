@@ -24,6 +24,7 @@ Thumbs.db
 *.lib
 *.sbr
 obj/
+bin/
 bin/Debug
 obj/Debug
 [Rr]elease*/
