@@ -12,10 +12,11 @@ await Host.CreateDefaultBuilder(args).ConfigureServices((context, services) =>
 }).ConfigureLogging((context, logging) =>
 {
     logging.ClearProviders();
+    logging.AddConfiguration(context.Configuration.GetSection("Logging"));
     logging.AddConsole();
     string path = context.Configuration.GetSection("Log").GetValue<string>("LogFolerPath");
     int? retainedFileCountLimit = context.Configuration.GetSection("Log").GetValue<int?>("retainedFileCountLimit");
-    logging.AddConfiguration(context.Configuration.GetSection("Logging"));
+    
     logging.AddFile(
         pathFormat: $"{path}\\Artonit2Tools.log",
         minimumLevel: context.Configuration.GetSection("Log").GetValue<LogLevel>("LogLevel"),
