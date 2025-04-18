@@ -65,7 +65,7 @@ namespace TS4
             catch (Exception Ex)
             {
                 logger.LogCritical("48 Не могу подключиться к базе данных Access " + options.Access_db_config + ". Проверьте строку подключения. Программа TS3 завершает работу.");
-                logger.LogCritical("82 \n" + Ex.Message.ToString());
+                logger.LogCritical("82 " + Ex.Message.ToString());
                 con.Close();
                 return;
             }
