@@ -9,11 +9,13 @@ await Host.CreateDefaultBuilder(args).ConfigureServices((context, services) =>
 
     services.AddSingleton(options);
     services.AddHostedService<Worker>();
+    //services.AddHostedService<WorkerTest>();
 }).ConfigureLogging((context, logging) =>
 {
     logging.ClearProviders();
     logging.AddConfiguration(context.Configuration.GetSection("Logging"));
     logging.AddConsole();
+    //logging.AddEventLog();  
     string path = context.Configuration.GetSection("Log").GetValue<string>("LogFolerPath");
     int? retainedFileCountLimit = context.Configuration.GetSection("Log").GetValue<int?>("retainedFileCountLimit");
     
