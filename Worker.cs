@@ -172,6 +172,7 @@ namespace TS4
             {
                 logger.LogError("144 Не могу подключиться к базе данных в потоке mainLine для id_dev=" + dev.controllerName + " IP " + dev.ip + " время выполнения " + (DateTime.Now - start) + ". Завершаю  работу с этим устройством.");
                 logger.LogError("147 name=" + dev.controllerName + " IP " + dev.ip + "mess " + Ex.Message.ToString());
+                con.Close();
                 return;
             }
             if (con.State != ConnectionState.Open)
