@@ -20,7 +20,7 @@ await Host.CreateDefaultBuilder(args).ConfigureServices((context, services) =>
     int? retainedFileCountLimit = context.Configuration.GetSection("Log").GetValue<int?>("retainedFileCountLimit");
     
     logging.AddFile(
-        pathFormat: $"{path}\\Artonit2Tools.log",
+        pathFormat: $"{path}\\ts4.log",
         minimumLevel: context.Configuration.GetSection("Log").GetValue<LogLevel>("LogLevel"),
         retainedFileCountLimit: retainedFileCountLimit,
         outputTemplate: "{Timestamp:dd-MM-yyyy HH:mm:ss.fff}\t-\t[{Level:u3}] {Message}{NewLine}{Exception}");

@@ -46,7 +46,7 @@ namespace TS4
                     logger.LogDebug("46 "+ex.ToString());
                     continue;
                 }
-                logger.LogTrace($@"timeout basip: {timeout}");
+                logger.LogTrace($@"timeout ts4 sleep on: {timeout}");
                 await Task.Delay(timeout, stoppingToken);
             }
         }
