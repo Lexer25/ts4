@@ -599,39 +599,51 @@ namespace TS4
                 {
                     if (remoteEvent == null)
                     {
-                        logger.LogDebug("Подписка отсуствует");
+                        logger.LogDebug("Worker4: Проверка подписки - объект remoteEvent отсутствует");
                         isSubscribed = false;
                         return false;
                     }
 
                     if (!isConnected)
                     {
-                        logger.LogDebug("Подключение к базе данных отсутствует");
+                        logger.LogDebug("Worker4: Проверка подписки - подключение к базе данных отсутствует (isConnected = false)");
                         isSubscribed = false;
                         return false;
                     }
 
-                    //string[] testEvents = { "CARDINDEV_INSERT" };
-                    //remoteEvent.QueueEvents(testEvents);
+                    // Активно проверяем состояние подписки, вызывая QueueEvents.
+                    // Если соединение событий разорвано, здесь возникнет исключение,
+                    // и мы пометим подписку как неактивную, чтобы запустить восстановление.
+                    string[] testEvents = { "CARDINDEV_INSERT" };
+                    remoteEvent.QueueEvents(testEvents);
+
                     isSubscribed = true;
-                    logger.LogDebug("Подписка активна");
+                    logger.LogDebug("Worker4: Проверка подписки - подписка активна (успешный QueueEvents)");
                     return true;
                 }
                 catch (InvalidOperationException ex)
                 {
-                    logger.LogWarning("Worker4: Подписка неактивна (InvalidOperationException): {Message}", ex.Message);
+                    // Если события уже запущены, это означает, что подписка активна и работает нормально
+                    if (ex.Message.Contains("already running") || ex.Message.Contains("Events are already running"))
+                    {
+                        isSubscribed = true;
+                        logger.LogDebug("Worker4: Проверка подписки - подписка активна (события уже запущены)");
+                        return true;
+                    }
+                    // Для других InvalidOperationException считаем подписку неактивной
+                    logger.LogWarning(ex, "Worker4: Подписка неактивна (InvalidOperationException) при проверке: {Message}", ex.Message);
                     isSubscribed = false;
                     return false;
                 }
                 catch (FbException ex)
                 {
-                    logger.LogWarning("Worker4: Ошибка Firebird при проверке подписки: {Message}", ex.Message);
+                    logger.LogWarning(ex, "Worker4: Ошибка Firebird при проверке подписки: {Message}", ex.Message);
                     isSubscribed = false;
                     return false;
                 }
                 catch (Exception ex)
                 {
-                    logger.LogWarning("Worker4: Ошибка при проверке подписки: {Message}", ex.Message);
+                    logger.LogWarning(ex, "Worker4: Общая ошибка при проверке подписки: {Message}", ex.Message);
                     isSubscribed = false;
                     return false;
                 }
