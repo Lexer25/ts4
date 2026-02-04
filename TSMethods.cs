@@ -2,6 +2,7 @@ using FirebirdSql.Data.FirebirdClient;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Data;
+using System.Threading;
 
 namespace TS4
 {
@@ -9,6 +10,24 @@ namespace TS4
 	{
 		private readonly ILogger<TSMethods> logger;
 		private readonly WorkerOptions options;
+
+		// Повторные попытки при разрыве соединения с Firebird
+		private const int MaxConnectionRetries = 3;
+		private const int ConnectionRetryDelayMs = 2000;
+
+		/// <summary>Проверяет, является ли исключение ошибкой разрыва соединения (можно повторить попытку).</summary>
+		private static bool IsConnectionError(Exception ex)
+		{
+			if (ex is System.IO.IOException) return true;
+			if (ex is FbException fbEx)
+			{
+				string msg = fbEx.Message ?? "";
+				return msg.Contains("Error writing data to the connection") ||
+					   msg.Contains("Error reading data from the connection") ||
+					   msg.Contains("Удаленный хост принудительно разорвал");
+			}
+			return false;
+		}
 
 		public TSMethods(ILogger<TSMethods> logger, WorkerOptions options)
 		{
@@ -23,138 +42,111 @@ namespace TS4
 			logger.LogTrace(lineStat);
 			DateTime _start = DateTime.Now;
 
-		FbConnection con = DBFirebird.Connect(db_config, logger);
-		try
-		{
-			con.Open();
-		}
-		catch (Exception Ex)
-		{
-			logger.LogError("144 Не могу подключиться к базе данных в потоке mainLine для id_dev=" + dev.controllerName + " IP " + dev.ip + " время выполнения " + (DateTime.Now - start) + ". Завершаю  работу с этим устройством.");
-			logger.LogError("147 name=" + dev.controllerName + " IP " + dev.ip + "mess " + Ex.Message.ToString());
-			try { con.Close(); } catch { }
-			try { con.Dispose(); } catch { }
-			logger.LogInformation($"299 Поток завершен (ошибка подключения к БД) для устройства: {dev.controllerName} IP: {dev.ip}");
-			return;
-		}
+		FbConnection con = null;
+		bool procedureExists = false;
+		bool triggerExists = false;
 
-		try
+		for (int attempt = 1; attempt <= MaxConnectionRetries; attempt++)
 		{
-			if (con.State != ConnectionState.Open)
-			{
-				try { con.Close(); } catch { }
-				try { con.Dispose(); } catch { }
-				logger.LogError("179 no connect db " + db_config + ". Завершаю поток для name=" + dev.controllerName + " IP " + dev.ip + " время выполнения " + (DateTime.Now - start), LogLevel.Error);
-				logger.LogInformation($"300 Поток завершен (нет подключения к БД) для устройства: {dev.controllerName} IP: {dev.ip}");
-				return;
-			}
-
-			// Проверка наличия процедуры CARDINDEV_TS4
-			bool procedureExists = false;
 			try
 			{
-				// Проверяем состояние соединения перед использованием
+				con = DBFirebird.Connect(db_config, logger);
+				con.Open();
 				if (con.State != ConnectionState.Open)
 				{
-					logger.LogWarning($"Соединение разорвано перед проверкой процедуры для устройства: {dev.controllerName} IP: {dev.ip}");
-					throw new InvalidOperationException("Соединение с базой данных закрыто");
+					try { con.Close(); } catch { }
+					try { con.Dispose(); } catch { }
+					con = null;
+					throw new InvalidOperationException("Соединение не открыто");
 				}
+
 				procedureExists = DBFirebird.ProcedurChec(con);
-			}
-			catch (FbException fbEx)
-			{
-				logger.LogError(fbEx, $"Ошибка Firebird при проверке процедуры для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
-				try { con.Close(); } catch { }
-				try { con.Dispose(); } catch { }
-				logger.LogInformation($"301 Поток завершен (ошибка при проверке процедуры) для устройства: {dev.controllerName} IP: {dev.ip}");
-				return;
-			}
-			catch (System.IO.IOException ioEx)
-			{
-				logger.LogError(ioEx, $"Ошибка сети при проверке процедуры для устройства: {dev.controllerName} IP: {dev.ip}. Соединение разорвано. Сообщение: {ioEx.Message}");
-				try { con.Close(); } catch { }
-				try { con.Dispose(); } catch { }
-				logger.LogInformation($"301 Поток завершен (разрыв соединения при проверке процедуры) для устройства: {dev.controllerName} IP: {dev.ip}");
-				return;
-			}
-			catch (Exception ex)
-			{
-				logger.LogError(ex, $"Общая ошибка при проверке процедуры для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {ex.Message}");
-				try { con.Close(); } catch { }
-				try { con.Dispose(); } catch { }
-				logger.LogInformation($"301 Поток завершен (ошибка при проверке процедуры) для устройства: {dev.controllerName} IP: {dev.ip}");
-				return;
-			}
-
-			if (procedureExists)
-			{
-				logger.LogInformation($"Проверка процедуры: процедура CARDINDEV_TS4 найдена в базе данных");
-			}
-			else
-			{
-				logger.LogError("Проверка процедуры: процедура CARDINDEV_TS4 не найдена в базе данных");
-				try { con.Close(); } catch { }
-				try { con.Dispose(); } catch { }
-				logger.LogInformation($"301 Поток завершен (отсутствует процедура) для устройства: {dev.controllerName} IP: {dev.ip}");
-				return;
-			}
-
-			// Проверка наличия триггера CARDINDEV_INSERT
-			bool triggerExists = false;
-			try
-			{
-				// Проверяем состояние соединения перед использованием
-				if (con.State != ConnectionState.Open)
+				if (!procedureExists)
 				{
-					logger.LogWarning($"Соединение разорвано перед проверкой триггера для устройства: {dev.controllerName} IP: {dev.ip}");
-					throw new InvalidOperationException("Соединение с базой данных закрыто");
+					logger.LogError("Проверка процедуры: процедура CARDINDEV_TS4 не найдена в базе данных");
+					try { con.Close(); } catch { }
+					try { con.Dispose(); } catch { }
+					logger.LogInformation($"301 Поток завершен (отсутствует процедура) для устройства: {dev.controllerName} IP: {dev.ip}");
+					return;
 				}
+
 				triggerExists = DBFirebird.TriggerCheck(con);
+				if (!triggerExists)
+				{
+					logger.LogError("Проверка триггера: триггер для события CARDINDEV_INSERT не найден в базе данных");
+					try { con.Close(); } catch { }
+					try { con.Dispose(); } catch { }
+					logger.LogInformation($"302 Поток завершен (отсутствует триггер) для устройства: {dev.controllerName} IP: {dev.ip}");
+					return;
+				}
+
+				break; // успех
 			}
-			catch (FbException fbEx)
+			catch (FbException fbEx) when (IsConnectionError(fbEx))
 			{
-				logger.LogError(fbEx, $"Ошибка Firebird при проверке триггера для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
-				try { con.Close(); } catch { }
-				try { con.Dispose(); } catch { }
-				logger.LogInformation($"302 Поток завершен (ошибка при проверке триггера) для устройства: {dev.controllerName} IP: {dev.ip}");
-				return;
+				try { con?.Close(); } catch { }
+				try { con?.Dispose(); } catch { }
+				con = null;
+				if (attempt < MaxConnectionRetries)
+				{
+					int delayMs = ConnectionRetryDelayMs * attempt;
+					//logger.LogWarning($"Разрыв соединения с БД для устройства {dev.controllerName} IP: {dev.ip}, попытка {attempt}/{MaxConnectionRetries}, повтор через {delayMs} мс");
+					Thread.Sleep(delayMs);
+				}
+				else
+				{
+					logger.LogError(fbEx, $"Ошибка Firebird при проверке процедуры/триггера для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
+					logger.LogInformation($"301 Поток завершен (разрыв соединения после {MaxConnectionRetries} попыток) для устройства: {dev.controllerName} IP: {dev.ip}");
+					return;
+				}
 			}
 			catch (System.IO.IOException ioEx)
 			{
-				logger.LogError(ioEx, $"Ошибка сети при проверке триггера для устройства: {dev.controllerName} IP: {dev.ip}. Соединение разорвано. Сообщение: {ioEx.Message}");
-				try { con.Close(); } catch { }
-				try { con.Dispose(); } catch { }
-				logger.LogInformation($"302 Поток завершен (разрыв соединения при проверке триггера) для устройства: {dev.controllerName} IP: {dev.ip}");
+				try { con?.Close(); } catch { }
+				try { con?.Dispose(); } catch { }
+				con = null;
+				if (attempt < MaxConnectionRetries)
+				{
+					int delayMs = ConnectionRetryDelayMs * attempt;
+					logger.LogWarning($"Ошибка сети при подключении к БД для устройства {dev.controllerName} IP: {dev.ip}, попытка {attempt}/{MaxConnectionRetries}, повтор через {delayMs} мс");
+					Thread.Sleep(delayMs);
+				}
+				else
+				{
+					logger.LogError(ioEx, $"Ошибка сети при проверке процедуры/триггера для устройства: {dev.controllerName} IP: {dev.ip}. Соединение разорвано.");
+					logger.LogInformation($"301 Поток завершен (разрыв соединения после {MaxConnectionRetries} попыток) для устройства: {dev.controllerName} IP: {dev.ip}");
+					return;
+				}
+			}
+			catch (FbException fbEx)
+			{
+				try { con?.Close(); } catch { }
+				try { con?.Dispose(); } catch { }
+				logger.LogError(fbEx, $"Ошибка Firebird при проверке процедуры/триггера для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
+				logger.LogInformation($"301 Поток завершен (ошибка при проверке) для устройства: {dev.controllerName} IP: {dev.ip}");
 				return;
 			}
 			catch (Exception ex)
 			{
-				logger.LogError(ex, $"Общая ошибка при проверке триггера для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {ex.Message}");
-				try { con.Close(); } catch { }
-				try { con.Dispose(); } catch { }
-				logger.LogInformation($"302 Поток завершен (ошибка при проверке триггера) для устройства: {dev.controllerName} IP: {dev.ip}");
-				return;
-			}
-
-			if (triggerExists)
-			{
-				logger.LogInformation($"Проверка триггера: триггер для события CARDINDEV_INSERT найден в базе данных");
-			}
-			else
-			{
-				logger.LogError("Проверка триггера: триггер для события CARDINDEV_INSERT не найден в базе данных");
-				try { con.Close(); } catch { }
-				try { con.Dispose(); } catch { }
-				logger.LogInformation($"302 Поток завершен (отсутствует триггер) для устройства: {dev.controllerName} IP: {dev.ip}");
+				try { con?.Close(); } catch { }
+				try { con?.Dispose(); } catch { }
+				if (attempt == 1 && ex is InvalidOperationException)
+				{
+					logger.LogError("144 Не могу подключиться к базе данных в потоке mainLine для id_dev=" + dev.controllerName + " IP " + dev.ip);
+					logger.LogError("147 name=" + dev.controllerName + " IP " + dev.ip + " mess " + ex.Message);
+				}
+				else
+				{
+					logger.LogError(ex, $"Ошибка при подключении/проверке для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {ex.Message}");
+				}
+				logger.LogInformation($"299 Поток завершен (ошибка подключения к БД) для устройства: {dev.controllerName} IP: {dev.ip}");
 				return;
 			}
 		}
-		catch (Exception ex)
+
+		if (con == null || !procedureExists || !triggerExists)
 		{
-			logger.LogError(ex, $"Критическая ошибка в MainLine для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {ex.Message}");
-			try { con.Close(); } catch { }
-			try { con.Dispose(); } catch { }
-			logger.LogInformation($"Поток завершен (критическая ошибка) для устройства: {dev.controllerName} IP: {dev.ip}");
+			logger.LogError($"Не удалось установить соединение с БД после всех попыток для устройства: {dev.controllerName} IP: {dev.ip}");
 			return;
 		}
 
@@ -353,7 +345,19 @@ namespace TS4
 						}
 						catch (FbException fbEx)
 						{
-							logger.LogError(fbEx, $"Ошибка Firebird при обновлении данных после записи для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
+							// Проверяем, является ли это ошибкой блокировки (retry логика уже обработала её)
+							bool isLockError = fbEx.Message.Contains("lock conflict") ||
+											  fbEx.Message.Contains("deadlock") ||
+											  fbEx.Message.Contains("update conflicts");
+							if (isLockError)
+							{
+								// Ошибка блокировки после всех попыток retry - логируем на уровне Debug, чтобы не засорять логи
+								logger.LogDebug($"Конфликт блокировки при обновлении данных после записи для устройства: {dev.controllerName} IP: {dev.ip} (все попытки retry исчерпаны)");
+							}
+							else
+							{
+								logger.LogError(fbEx, $"Ошибка Firebird при обновлении данных после записи для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
+							}
 						}
 						catch (System.IO.IOException ioEx)
 						{
@@ -370,7 +374,19 @@ namespace TS4
 						}
 						catch (FbException fbEx)
 						{
-							logger.LogError(fbEx, $"Ошибка Firebird при обновлении данных после неудачной записи для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
+							// Проверяем, является ли это ошибкой блокировки (retry логика уже обработала её)
+							bool isLockError = fbEx.Message.Contains("lock conflict") ||
+											  fbEx.Message.Contains("deadlock") ||
+											  fbEx.Message.Contains("update conflicts");
+							if (isLockError)
+							{
+								// Ошибка блокировки после всех попыток retry - логируем на уровне Debug, чтобы не засорять логи
+								logger.LogDebug($"Конфликт блокировки при обновлении данных после неудачной записи для устройства: {dev.controllerName} IP: {dev.ip} (все попытки retry исчерпаны)");
+							}
+							else
+							{
+								logger.LogError(fbEx, $"Ошибка Firebird при обновлении данных после неудачной записи для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
+							}
 						}
 						catch (System.IO.IOException ioEx)
 						{
@@ -388,7 +404,19 @@ namespace TS4
 						}
 						catch (FbException fbEx)
 						{
-							logger.LogError(fbEx, $"Ошибка Firebird при удалении данных после удаления карты для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
+							// Проверяем, является ли это ошибкой блокировки (retry логика уже обработала её)
+							bool isLockError = fbEx.Message.Contains("lock conflict") ||
+											  fbEx.Message.Contains("deadlock") ||
+											  fbEx.Message.Contains("update conflicts");
+							if (isLockError)
+							{
+								// Ошибка блокировки после всех попыток retry - логируем на уровне Debug, чтобы не засорять логи
+								logger.LogDebug($"Конфликт блокировки при удалении данных после удаления карты для устройства: {dev.controllerName} IP: {dev.ip} (все попытки retry исчерпаны)");
+							}
+							else
+							{
+								logger.LogError(fbEx, $"Ошибка Firebird при удалении данных после удаления карты для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
+							}
 						}
 						catch (System.IO.IOException ioEx)
 						{
@@ -404,7 +432,19 @@ namespace TS4
 						}
 						catch (FbException fbEx)
 						{
-							logger.LogError(fbEx, $"Ошибка Firebird при обновлении данных после неудачного удаления для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
+							// Проверяем, является ли это ошибкой блокировки (retry логика уже обработала её)
+							bool isLockError = fbEx.Message.Contains("lock conflict") ||
+											  fbEx.Message.Contains("deadlock") ||
+											  fbEx.Message.Contains("update conflicts");
+							if (isLockError)
+							{
+								// Ошибка блокировки после всех попыток retry - логируем на уровне Debug, чтобы не засорять логи
+								logger.LogDebug($"Конфликт блокировки при обновлении данных после неудачного удаления для устройства: {dev.controllerName} IP: {dev.ip} (все попытки retry исчерпаны)");
+							}
+							else
+							{
+								logger.LogError(fbEx, $"Ошибка Firebird при обновлении данных после неудачного удаления для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
+							}
 						}
 						catch (System.IO.IOException ioEx)
 						{

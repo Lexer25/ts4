@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Data;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Linq;
 using Microsoft.Extensions.Logging;
@@ -15,6 +16,48 @@ namespace TS4
     class DBFirebird
     {
         public static ILogger _logger;
+        
+        // Константы для retry логики при deadlock
+        private const int MaxRetryAttempts = 10; // Увеличено количество попыток
+        private const int BaseRetryDelayMs = 100; // Увеличена базовая задержка в миллисекундах
+        
+        /// <summary>
+        /// Выполняет операцию с повторными попытками при возникновении ошибок блокировки
+        /// </summary>
+        private static bool ExecuteWithRetry(Func<bool> operation, string operationName, int idCardInDev)
+        {
+            int attempt = 0;
+            while (attempt < MaxRetryAttempts)
+            {
+                try
+                {
+                    return operation();
+                }
+                catch (FbException fbEx)
+                {
+                    // Проверяем, является ли это ошибкой блокировки/deadlock
+                    bool isLockError = fbEx.Message.Contains("lock conflict") ||
+                                      fbEx.Message.Contains("deadlock") ||
+                                      fbEx.Message.Contains("update conflicts") ||
+                                      fbEx.ErrorCode == 335544336; // isc_lock_conflict
+                    
+                    if (isLockError && attempt < MaxRetryAttempts - 1)
+                    {
+                        attempt++;
+                        // Экспоненциальная задержка: 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms, 12800ms, 25600ms
+                        int delay = BaseRetryDelayMs * (int)Math.Pow(2, attempt - 1);
+                        //_logger?.LogDebug($"{operationName}: Конфликт блокировки для id_cardindev={idCardInDev}, попытка {attempt}/{MaxRetryAttempts}, ожидание {delay}ms");
+                        Thread.Sleep(delay);
+                        continue;
+                    }
+                    
+                    // Если это не ошибка блокировки или исчерпаны попытки - пробрасываем исключение
+                    throw;
+                }
+            }
+            
+            return false;
+        }
         public static FbConnection Connect(string connectionString, ILogger logger)
         {
             _logger = logger;
@@ -82,6 +125,7 @@ namespace TS4
          */
         public static bool UpdateIdxCard(FbConnection con, DataRow row, string result, bool s_e)
         {
+            int idCardInDev = Convert.ToInt32(row["id_cardindev"]);
             string id_cardindev = "";
             if (s_e)
             {
@@ -91,33 +135,47 @@ namespace TS4
                 set cdx.load_time='now',
                 cdx.load_result='{result.Substring(0, Math.Min(result.Length, 100))}'
                 {id_cardindev}
-                where cdx.id_cardindev={row["id_cardindev"]}";
-            using (FbCommand getcomand = new FbCommand(sql, con))
+                where cdx.id_cardindev={idCardInDev}";
+            
+            return ExecuteWithRetry(() =>
             {
-                int rowsAffected = getcomand.ExecuteNonQuery();
-                return rowsAffected > 0;
-            }
+                using (FbCommand getcomand = new FbCommand(sql, con))
+                {
+                    int rowsAffected = getcomand.ExecuteNonQuery();
+                    return rowsAffected > 0;
+                }
+            }, "UpdateIdxCard", idCardInDev);
         }
         public static bool DeleteCardInDev(FbConnection con, DataRow row)
         {
+            int idCardInDev = Convert.ToInt32(row["id_cardindev"]);
             string sql = $@"delete from cardindev cd
-            where cd.id_cardindev ={row["id_cardindev"]}";
-            using (FbCommand getcomand = new FbCommand(sql, con))
+            where cd.id_cardindev ={idCardInDev}";
+            
+            return ExecuteWithRetry(() =>
             {
-                int rowsAffected = getcomand.ExecuteNonQuery();
-                return rowsAffected > 0;
-            }
+                using (FbCommand getcomand = new FbCommand(sql, con))
+                {
+                    int rowsAffected = getcomand.ExecuteNonQuery();
+                    return rowsAffected > 0;
+                }
+            }, "DeleteCardInDev", idCardInDev);
         }
         public static bool UpdateCardInDevIncrement(FbConnection con, DataRow row)
         {
+            int idCardInDev = Convert.ToInt32(row["id_cardindev"]);
             string sql = $@"update cardindev cd
             set cd.attempts=cd.attempts+1
-            where cd.id_cardindev={row["id_cardindev"]}";
-            using (FbCommand getcomand = new FbCommand(sql, con))
+            where cd.id_cardindev={idCardInDev}";
+            
+            return ExecuteWithRetry(() =>
             {
-                int rowsAffected = getcomand.ExecuteNonQuery();
-                return rowsAffected > 0;
-            }
+                using (FbCommand getcomand = new FbCommand(sql, con))
+                {
+                    int rowsAffected = getcomand.ExecuteNonQuery();
+                    return rowsAffected > 0;
+                }
+            }, "UpdateCardInDevIncrement", idCardInDev);
         }
 
 
