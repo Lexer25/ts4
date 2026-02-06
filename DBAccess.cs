@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.OleDb;
@@ -17,10 +17,12 @@ namespace TS4
         }
         public static DataTable GetDevice(OleDbConnection con)
         {
-            OleDbCommand command = new OleDbCommand("SELECT ID, Name, ConnectionString, Driver from Device where Enabled=1", con);
-            var reader = command.ExecuteReader();
-            DataTable table = new DataTable();
-            table.Load(reader);
+            var table = new DataTable();
+            using (var command = new OleDbCommand("SELECT ID, Name, ConnectionString, Driver from Device where Enabled=1", con))
+            using (var reader = command.ExecuteReader())
+            {
+                table.Load(reader);
+            }
             return table;
         }
     }

@@ -16,8 +16,9 @@ namespace TS4
         
         public DEV(DataRow row)
         {
-            this.id = null; // Будет установлен позже из Firebird базы
-            this.ip = (string)row["ConnectionString"];
+            this.id = null;
+            this.ip = row["ConnectionString"].ToString().Trim();
+            //this.ip = (string)row["ConnectionString"];
             this.controllerName = (string)row["Name"];
             this.driver = (string)row["Driver"];
         }

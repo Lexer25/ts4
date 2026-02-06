@@ -29,6 +29,13 @@ namespace TS4
 			return false;
 		}
 
+		/// <summary>Ошибка целостности Firebird (bugcheck) — не повторять, проверить сервер и БД.</summary>
+		private static bool IsConsistencyError(FbException ex)
+		{
+			string msg = ex.Message ?? "";
+			return msg.Contains("consistency check") || msg.Contains("bugcheck");
+		}
+
 		public TSMethods(ILogger<TSMethods> logger, WorkerOptions options)
 		{
 			this.logger = logger;
@@ -42,9 +49,8 @@ namespace TS4
 			logger.LogTrace(lineStat);
 			DateTime _start = DateTime.Now;
 
+		// Проверка процедуры и триггера выполняется один раз при старте программы (Program.cs), здесь только открываем соединение
 		FbConnection con = null;
-		bool procedureExists = false;
-		bool triggerExists = false;
 
 		for (int attempt = 1; attempt <= MaxConnectionRetries; attempt++)
 		{
@@ -59,28 +65,7 @@ namespace TS4
 					con = null;
 					throw new InvalidOperationException("Соединение не открыто");
 				}
-
-				procedureExists = DBFirebird.ProcedurChec(con);
-				if (!procedureExists)
-				{
-					logger.LogError("Проверка процедуры: процедура CARDINDEV_TS4 не найдена в базе данных");
-					try { con.Close(); } catch { }
-					try { con.Dispose(); } catch { }
-					logger.LogInformation($"301 Поток завершен (отсутствует процедура) для устройства: {dev.controllerName} IP: {dev.ip}");
-					return;
-				}
-
-				triggerExists = DBFirebird.TriggerCheck(con);
-				if (!triggerExists)
-				{
-					logger.LogError("Проверка триггера: триггер для события CARDINDEV_INSERT не найден в базе данных");
-					try { con.Close(); } catch { }
-					try { con.Dispose(); } catch { }
-					logger.LogInformation($"302 Поток завершен (отсутствует триггер) для устройства: {dev.controllerName} IP: {dev.ip}");
-					return;
-				}
-
-				break; // успех
+				break;
 			}
 			catch (FbException fbEx) when (IsConnectionError(fbEx))
 			{
@@ -90,13 +75,12 @@ namespace TS4
 				if (attempt < MaxConnectionRetries)
 				{
 					int delayMs = ConnectionRetryDelayMs * attempt;
-					//logger.LogWarning($"Разрыв соединения с БД для устройства {dev.controllerName} IP: {dev.ip}, попытка {attempt}/{MaxConnectionRetries}, повтор через {delayMs} мс");
 					Thread.Sleep(delayMs);
 				}
 				else
 				{
-					logger.LogError(fbEx, $"Ошибка Firebird при проверке процедуры/триггера для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
-					logger.LogInformation($"301 Поток завершен (разрыв соединения после {MaxConnectionRetries} попыток) для устройства: {dev.controllerName} IP: {dev.ip}");
+					logger.LogError(fbEx, $"Ошибка Firebird при подключении к БД для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
+					logger.LogInformation($"299 Поток завершен (разрыв соединения после {MaxConnectionRetries} попыток) для устройства: {dev.controllerName} IP: {dev.ip}");
 					return;
 				}
 			}
@@ -108,13 +92,13 @@ namespace TS4
 				if (attempt < MaxConnectionRetries)
 				{
 					int delayMs = ConnectionRetryDelayMs * attempt;
-					logger.LogWarning($"Ошибка сети при подключении к БД для устройства {dev.controllerName} IP: {dev.ip}, попытка {attempt}/{MaxConnectionRetries}, повтор через {delayMs} мс");
+					logger.LogWarning($"Ошибка сети при подключении к БД для устройства: {dev.controllerName} IP: {dev.ip}, попытка {attempt}/{MaxConnectionRetries}, повтор через {delayMs} мс");
 					Thread.Sleep(delayMs);
 				}
 				else
 				{
-					logger.LogError(ioEx, $"Ошибка сети при проверке процедуры/триггера для устройства: {dev.controllerName} IP: {dev.ip}. Соединение разорвано.");
-					logger.LogInformation($"301 Поток завершен (разрыв соединения после {MaxConnectionRetries} попыток) для устройства: {dev.controllerName} IP: {dev.ip}");
+					logger.LogError(ioEx, $"Ошибка сети при подключении к БД для устройства: {dev.controllerName} IP: {dev.ip}. Соединение разорвано.");
+					logger.LogInformation($"299 Поток завершен (разрыв соединения после {MaxConnectionRetries} попыток) для устройства: {dev.controllerName} IP: {dev.ip}");
 					return;
 				}
 			}
@@ -122,14 +106,15 @@ namespace TS4
 			{
 				try { con?.Close(); } catch { }
 				try { con?.Dispose(); } catch { }
-				logger.LogError(fbEx, $"Ошибка Firebird при проверке процедуры/триггера для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
-				logger.LogInformation($"301 Поток завершен (ошибка при проверке) для устройства: {dev.controllerName} IP: {dev.ip}");
+				logger.LogError(fbEx, $"Ошибка Firebird при подключении к БД для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
+				logger.LogInformation($"299 Поток завершен (ошибка подключения) для устройства: {dev.controllerName} IP: {dev.ip}");
 				return;
 			}
 			catch (Exception ex)
 			{
 				try { con?.Close(); } catch { }
 				try { con?.Dispose(); } catch { }
+				con = null;
 				if (attempt == 1 && ex is InvalidOperationException)
 				{
 					logger.LogError("144 Не могу подключиться к базе данных в потоке mainLine для id_dev=" + dev.controllerName + " IP " + dev.ip);
@@ -137,14 +122,14 @@ namespace TS4
 				}
 				else
 				{
-					logger.LogError(ex, $"Ошибка при подключении/проверке для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {ex.Message}");
+					logger.LogError(ex, $"Ошибка при подключении к БД для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {ex.Message}");
 				}
 				logger.LogInformation($"299 Поток завершен (ошибка подключения к БД) для устройства: {dev.controllerName} IP: {dev.ip}");
 				return;
 			}
 		}
 
-		if (con == null || !procedureExists || !triggerExists)
+		if (con == null)
 		{
 			logger.LogError($"Не удалось установить соединение с БД после всех попыток для устройства: {dev.controllerName} IP: {dev.ip}");
 			return;
@@ -231,7 +216,10 @@ namespace TS4
 		}
 		catch (FbException fbEx)
 		{
-			logger.LogError(fbEx, $"Ошибка Firebird при получении команд для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
+			if (IsConsistencyError(fbEx))
+				logger.LogWarning("Ошибка целостности Firebird (bugcheck). Проверьте логи Firebird и при необходимости gfix. Устройство: {Dev} IP: {Ip}", dev.controllerName, dev.ip);
+			else
+				logger.LogError(fbEx, "Ошибка Firebird при получении команд для устройства: {Dev} IP: {Ip}. {Message}", dev.controllerName, dev.ip, fbEx.Message);
 			return;
 		}
 		catch (System.IO.IOException ioEx)
@@ -254,46 +242,109 @@ namespace TS4
 				cmds.Add(new Command(row, comand));
 			}
 
-			//logger.LogTrace(@$"258  name = {dev.controllerName} {cmds.Count()}  /");
+			logger.LogTrace(@$"258  name = {dev.controllerName} всего команд: {cmds.Count()}  /");
+
+		var successWrites = new List<(DataRow row, string result)>();
+		var successDeletes = new List<DataRow>();
+		var failWrites = new List<(DataRow row, string result)>();
+		var failDeletes = new List<DataRow>();
+
+		DateTime batchStart = DateTime.Now;
+		DateTime cmdPrevTime = DateTime.Now;
+		int cmdIndex = 0;
 
 		foreach (Command cmd in cmds)
 		{
 			try
 			{
-				// Проверяем состояние соединения перед каждой операцией
 				if (con == null || con.State != ConnectionState.Open)
 				{
 					logger.LogWarning($"Соединение с БД разорвано во время обработки команды для устройства: {dev.controllerName} IP: {dev.ip}");
 					break;
 				}
 
+				var cmdStartTime = DateTime.Now;
+				var timeSincePrevMs = cmdIndex > 0 ? (cmdStartTime - cmdPrevTime).TotalMilliseconds : 0;
+
 				string operationType = ((int)cmd.dataRow["operation"] == 1) ? "Write" : "Delete";
-				logger.LogInformation(@$"{operationType} operation: id_dev={cmd.dataRow["id_dev"]} name={dev.controllerName} reader={cmd.dataRow["id_reader"]} card={cmd.dataRow["id_card"]} IP={dev.ip} Command: {cmd.command}");
-				
-				string answer = "";
-				answer = com.ComandExecute(cmd.command);
-				AfterComand(answer, con, cmd.dataRow, dev, operationType);
-				logger.LogCritical(@$"Answer destination:  {(((int)cmd.dataRow["operation"] == 1) ? "AddCard " : "DeleteCard")} id_dev={cmd.dataRow["id_dev"]} name={dev.controllerName} reader={cmd.dataRow["id_reader"]} IP={dev.ip} Command: {cmd.command} Answer: {answer}");
+				logger.LogInformation($"259 {operationType} operation: id_dev={cmd.dataRow["id_dev"]} name={dev.controllerName} reader={cmd.dataRow["id_reader"]} card={cmd.dataRow["id_card"]} IP={dev.ip} Command: {cmd.command} | since_prev_ms={timeSincePrevMs:F0}");
+
+				string answer = com.ComandExecute(cmd.command);
+
+				var cmdDurationMs = (DateTime.Now - cmdStartTime).TotalMilliseconds;
+				logger.LogCritical(@$"Answer: {(((int)cmd.dataRow["operation"] == 1) ? "AddCard " : "DeleteCard")} id_dev={cmd.dataRow["id_dev"]} name={dev.controllerName} reader={cmd.dataRow["id_reader"]} IP={dev.ip} Answer: {answer} | cmd_duration_ms={cmdDurationMs:F0}");
+
+				bool isOk = answer?.ToUpper().Contains("OK") == true;
+				if ((int)cmd.dataRow["operation"] == 1) // Write
+				{
+					if (isOk) successWrites.Add((cmd.dataRow, answer ?? ""));
+					else failWrites.Add((cmd.dataRow, answer ?? ""));
+				}
+				else // Delete
+				{
+					if (isOk) successDeletes.Add(cmd.dataRow);
+					else failDeletes.Add(cmd.dataRow);
+				}
+
+				cmdPrevTime = DateTime.Now;
+				cmdIndex++;
 			}
 			catch (FbException fbEx)
 			{
-				logger.LogError(fbEx, $"Ошибка Firebird при обработке команды для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
-				// Продолжаем обработку следующих команд
+				if (IsConsistencyError(fbEx))
+				{
+					logger.LogWarning("Ошибка целостности Firebird (bugcheck). Прерываем обработку устройства. Устройство: {Dev} IP: {Ip}", dev.controllerName, dev.ip);
+					break;
+				}
+				logger.LogError(fbEx, "Ошибка Firebird при обработке команды для устройства: {Dev} IP: {Ip}. {Message}", dev.controllerName, dev.ip, fbEx.Message);
 				continue;
 			}
 			catch (System.IO.IOException ioEx)
 			{
-				logger.LogError(ioEx, $"Ошибка сети при обработке команды для устройства: {dev.controllerName} IP: {dev.ip}. Соединение разорвано. Сообщение: {ioEx.Message}");
-				// Прерываем обработку, так как соединение разорвано
+				logger.LogError(ioEx, "Ошибка сети при обработке команды для устройства: {Dev} IP: {Ip}. Соединение разорвано.", dev.controllerName, dev.ip);
 				break;
 			}
 			catch (Exception ex)
 			{
-				logger.LogError(ex, $"Общая ошибка при обработке команды для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {ex.Message}");
-				// Продолжаем обработку следующих команд
+				logger.LogError(ex, "Общая ошибка при обработке команды для устройства: {Dev} IP: {Ip}. {Message}", dev.controllerName, dev.ip, ex.Message);
 				continue;
 			}
 		}
+
+		// Пакетное обновление Firebird (2–4 round-trip вместо 2*N)
+		try
+		{
+			if (successWrites.Count > 0 || successDeletes.Count > 0)
+			{
+				DBFirebird.BatchSuccess(con, successWrites, successDeletes);
+				foreach (var x in successWrites)
+					logger.LogInformation("Write completed: id_dev={Id} name={Name} reader={Reader} card={Card} IP={Ip}", x.row["id_dev"], dev.controllerName, x.row["id_reader"], x.row["id_card"], dev.ip);
+				foreach (var row in successDeletes)
+					logger.LogInformation("Delete completed: id_dev={Id} name={Name} reader={Reader} card={Card} IP={Ip}", row["id_dev"], dev.controllerName, row["id_reader"], row["id_card"], dev.ip);
+			}
+			if (failWrites.Count > 0 || failDeletes.Count > 0)
+			{
+				DBFirebird.BatchFail(con, failWrites, failDeletes);
+				foreach (var x in failWrites)
+					logger.LogWarning("Write failed: id_dev={Id} name={Name} reader={Reader} card={Card} IP={Ip} Answer: {Ans}", x.row["id_dev"], dev.controllerName, x.row["id_reader"], x.row["id_card"], dev.ip, x.result);
+				foreach (var row in failDeletes)
+					logger.LogWarning("Delete failed: id_dev={Id} name={Name} reader={Reader} card={Card} IP={Ip}", row["id_dev"], dev.controllerName, row["id_reader"], row["id_card"], dev.ip);
+			}
+		}
+		catch (FbException fbEx)
+		{
+			if (IsConsistencyError(fbEx))
+				logger.LogWarning("Ошибка целостности Firebird при пакетном обновлении. Устройство: {Dev} IP: {Ip}", dev.controllerName, dev.ip);
+			else
+				logger.LogError(fbEx, "Ошибка Firebird при пакетном обновлении для устройства: {Dev} IP: {Ip}. {Message}", dev.controllerName, dev.ip, fbEx.Message);
+		}
+		catch (Exception ex)
+		{
+			logger.LogError(ex, "Ошибка при пакетном обновлении для устройства: {Dev} IP: {Ip}. {Message}", dev.controllerName, dev.ip, ex.Message);
+		}
+
+		var batchTotalMs = (DateTime.Now - batchStart).TotalMilliseconds;
+		logger.LogInformation("Batch complete: name={Name} IP={Ip} commands={Count} total_ms={TotalMs:F0} ({PerSec:F1} cmd/sec)", dev.controllerName, dev.ip, cmdIndex, batchTotalMs, cmdIndex > 0 ? cmdIndex * 1000.0 / batchTotalMs : 0);
 		}
 
 	private string ComandBuilder(DataRow? row)
@@ -345,19 +396,12 @@ namespace TS4
 						}
 						catch (FbException fbEx)
 						{
-							// Проверяем, является ли это ошибкой блокировки (retry логика уже обработала её)
-							bool isLockError = fbEx.Message.Contains("lock conflict") ||
-											  fbEx.Message.Contains("deadlock") ||
-											  fbEx.Message.Contains("update conflicts");
-							if (isLockError)
-							{
-								// Ошибка блокировки после всех попыток retry - логируем на уровне Debug, чтобы не засорять логи
-								logger.LogDebug($"Конфликт блокировки при обновлении данных после записи для устройства: {dev.controllerName} IP: {dev.ip} (все попытки retry исчерпаны)");
-							}
+							if (IsConsistencyError(fbEx))
+								logger.LogWarning("Ошибка целостности Firebird (bugcheck). Проверьте логи Firebird и при необходимости gfix. Устройство: {Dev} IP: {Ip}", dev.controllerName, dev.ip);
+							else if (fbEx.Message != null && (fbEx.Message.Contains("lock conflict") || fbEx.Message.Contains("deadlock") || fbEx.Message.Contains("update conflicts")))
+								logger.LogDebug("Конфликт блокировки при обновлении данных после записи для устройства: {Dev} IP: {Ip}", dev.controllerName, dev.ip);
 							else
-							{
-								logger.LogError(fbEx, $"Ошибка Firebird при обновлении данных после записи для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
-							}
+								logger.LogError(fbEx, "Ошибка Firebird при обновлении данных после записи для устройства: {Dev} IP: {Ip}. {Message}", dev.controllerName, dev.ip, fbEx.Message);
 						}
 						catch (System.IO.IOException ioEx)
 						{
@@ -366,7 +410,7 @@ namespace TS4
 					}
 					else
 					{
-						logger.LogWarning(@$"Write operation failed: id_dev={row["id_dev"]} name={dev.controllerName} reader={row["id_reader"]} card={row["id_card"]} IP={dev.ip} Answer: {anser}");
+						logger.LogWarning(@$"358 Write operation failed: id_dev={row["id_dev"]} name={dev.controllerName} reader={row["id_reader"]} card={row["id_card"]} IP={dev.ip} Answer: {anser}");
 						try
 						{
 							DBFirebird.UpdateIdxCard(con, row, anser, false);
@@ -374,19 +418,12 @@ namespace TS4
 						}
 						catch (FbException fbEx)
 						{
-							// Проверяем, является ли это ошибкой блокировки (retry логика уже обработала её)
-							bool isLockError = fbEx.Message.Contains("lock conflict") ||
-											  fbEx.Message.Contains("deadlock") ||
-											  fbEx.Message.Contains("update conflicts");
-							if (isLockError)
-							{
-								// Ошибка блокировки после всех попыток retry - логируем на уровне Debug, чтобы не засорять логи
-								logger.LogDebug($"Конфликт блокировки при обновлении данных после неудачной записи для устройства: {dev.controllerName} IP: {dev.ip} (все попытки retry исчерпаны)");
-							}
+							if (IsConsistencyError(fbEx))
+								logger.LogWarning("Ошибка целостности Firebird (bugcheck). Проверьте логи Firebird и при необходимости gfix. Устройство: {Dev} IP: {Ip}", dev.controllerName, dev.ip);
+							else if (fbEx.Message != null && (fbEx.Message.Contains("lock conflict") || fbEx.Message.Contains("deadlock") || fbEx.Message.Contains("update conflicts")))
+								logger.LogDebug("Конфликт блокировки при обновлении данных после неудачной записи для устройства: {Dev} IP: {Ip}", dev.controllerName, dev.ip);
 							else
-							{
-								logger.LogError(fbEx, $"Ошибка Firebird при обновлении данных после неудачной записи для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
-							}
+								logger.LogError(fbEx, "Ошибка Firebird при обновлении данных после неудачной записи для устройства: {Dev} IP: {Ip}. {Message}", dev.controllerName, dev.ip, fbEx.Message);
 						}
 						catch (System.IO.IOException ioEx)
 						{
@@ -397,26 +434,19 @@ namespace TS4
 				case 2:
 					if (anser.ToUpper().Contains("OK"))
 					{
-						logger.LogInformation(@$"Delete operation completed successfully: id_dev={row["id_dev"]} name={dev.controllerName} reader={row["id_reader"]} card={row["id_card"]} IP={dev.ip}");
+						logger.LogInformation(@$" 382 Delete operation completed successfully: id_dev={row["id_dev"]} name={dev.controllerName} reader={row["id_reader"]} card={row["id_card"]} IP={dev.ip}");
 						try
 						{
 							DBFirebird.DeleteCardInDev(con, row);
 						}
 						catch (FbException fbEx)
 						{
-							// Проверяем, является ли это ошибкой блокировки (retry логика уже обработала её)
-							bool isLockError = fbEx.Message.Contains("lock conflict") ||
-											  fbEx.Message.Contains("deadlock") ||
-											  fbEx.Message.Contains("update conflicts");
-							if (isLockError)
-							{
-								// Ошибка блокировки после всех попыток retry - логируем на уровне Debug, чтобы не засорять логи
-								logger.LogDebug($"Конфликт блокировки при удалении данных после удаления карты для устройства: {dev.controllerName} IP: {dev.ip} (все попытки retry исчерпаны)");
-							}
+							if (IsConsistencyError(fbEx))
+								logger.LogWarning("Ошибка целостности Firebird (bugcheck). Проверьте логи Firebird и при необходимости gfix. Устройство: {Dev} IP: {Ip}", dev.controllerName, dev.ip);
+							else if (fbEx.Message != null && (fbEx.Message.Contains("lock conflict") || fbEx.Message.Contains("deadlock") || fbEx.Message.Contains("update conflicts")))
+								logger.LogDebug("Конфликт блокировки при удалении данных после удаления карты для устройства: {Dev} IP: {Ip}", dev.controllerName, dev.ip);
 							else
-							{
-								logger.LogError(fbEx, $"Ошибка Firebird при удалении данных после удаления карты для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
-							}
+								logger.LogError(fbEx, "Ошибка Firebird при удалении данных после удаления карты для устройства: {Dev} IP: {Ip}. {Message}", dev.controllerName, dev.ip, fbEx.Message);
 						}
 						catch (System.IO.IOException ioEx)
 						{
@@ -425,26 +455,19 @@ namespace TS4
 					}
 					else
 					{
-						logger.LogWarning(@$"Delete operation failed: id_dev={row["id_dev"]} name={dev.controllerName} reader={row["id_reader"]} card={row["id_card"]} IP={dev.ip} Answer: {anser}");
+						logger.LogWarning(@$" 403 Delete operation failed: id_dev={row["id_dev"]} name={dev.controllerName} reader={row["id_reader"]} card={row["id_card"]} IP={dev.ip} Answer: {anser}");
 						try
 						{
 							DBFirebird.UpdateCardInDevIncrement(con, row);
 						}
 						catch (FbException fbEx)
 						{
-							// Проверяем, является ли это ошибкой блокировки (retry логика уже обработала её)
-							bool isLockError = fbEx.Message.Contains("lock conflict") ||
-											  fbEx.Message.Contains("deadlock") ||
-											  fbEx.Message.Contains("update conflicts");
-							if (isLockError)
-							{
-								// Ошибка блокировки после всех попыток retry - логируем на уровне Debug, чтобы не засорять логи
-								logger.LogDebug($"Конфликт блокировки при обновлении данных после неудачного удаления для устройства: {dev.controllerName} IP: {dev.ip} (все попытки retry исчерпаны)");
-							}
+							if (IsConsistencyError(fbEx))
+								logger.LogWarning("Ошибка целостности Firebird (bugcheck). Проверьте логи Firebird и при необходимости gfix. Устройство: {Dev} IP: {Ip}", dev.controllerName, dev.ip);
+							else if (fbEx.Message != null && (fbEx.Message.Contains("lock conflict") || fbEx.Message.Contains("deadlock") || fbEx.Message.Contains("update conflicts")))
+								logger.LogDebug("Конфликт блокировки при обновлении данных после неудачного удаления для устройства: {Dev} IP: {Ip}", dev.controllerName, dev.ip);
 							else
-							{
-								logger.LogError(fbEx, $"Ошибка Firebird при обновлении данных после неудачного удаления для устройства: {dev.controllerName} IP: {dev.ip}. Сообщение: {fbEx.Message}");
-							}
+								logger.LogError(fbEx, "Ошибка Firebird при обновлении данных после неудачного удаления для устройства: {Dev} IP: {Ip}. {Message}", dev.controllerName, dev.ip, fbEx.Message);
 						}
 						catch (System.IO.IOException ioEx)
 						{

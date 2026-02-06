@@ -1,4 +1,4 @@
-﻿using FirebirdSql.Data.FirebirdClient;
+using FirebirdSql.Data.FirebirdClient;
 using FirebirdSql.Data.Isql;
 using System;
 using System.Collections.Generic;
@@ -35,10 +35,21 @@ namespace TS4
                 }
                 catch (FbException fbEx)
                 {
+                    // Ошибка внутренней целостности Firebird (bugcheck) — не повторяем, не нагружаем сервер
+                    bool isConsistencyError = fbEx.Message != null && (
+                        fbEx.Message.Contains("consistency check") ||
+                        fbEx.Message.Contains("bugcheck"));
+                    if (isConsistencyError)
+                    {
+                        _logger?.LogWarning("{OperationName}: Ошибка целостности Firebird (bugcheck), повтор не выполняется. id_cardindev={Id}", operationName, idCardInDev);
+                        throw;
+                    }
+
                     // Проверяем, является ли это ошибкой блокировки/deadlock
-                    bool isLockError = fbEx.Message.Contains("lock conflict") ||
-                                      fbEx.Message.Contains("deadlock") ||
-                                      fbEx.Message.Contains("update conflicts") ||
+                    string fbMsg = fbEx.Message ?? "";
+                    bool isLockError = fbMsg.Contains("lock conflict") ||
+                                      fbMsg.Contains("deadlock") ||
+                                      fbMsg.Contains("update conflicts") ||
                                       fbEx.ErrorCode == 335544336; // isc_lock_conflict
                     
                     if (isLockError && attempt < MaxRetryAttempts - 1)
@@ -106,7 +117,7 @@ namespace TS4
         }
         public static DataTable GetComandForDevice(FbConnection con, string name)
         {
-            string sql = $@"select distinct cg.id_dev, cg.id_reader, cg.id_card, cg.timezones, cg.operation, cg.id_cardindev from cardindev_ts4(1, '{name}') cg
+            string sql = $@"select first 500 distinct cg.id_dev, cg.id_reader, cg.id_card, cg.timezones, cg.operation, cg.id_cardindev from cardindev_ts4(1, '{name}') cg
              order by cg.id_cardindev";
 
             //_logger.LogDebug($@"121 " + sql);
@@ -176,6 +187,77 @@ namespace TS4
                     return rowsAffected > 0;
                 }
             }, "UpdateCardInDevIncrement", idCardInDev);
+        }
+
+        /// <summary>
+        /// Пакетное обновление cardidx (только для Write) и удаление из cardindev.
+        /// successWrites — успешные записи (UpdateIdxCard + Delete). successDeletes — успешные удаления (только Delete).
+        /// 2–3 round-trip вместо 2*N.
+        /// </summary>
+        public static void BatchSuccess(FbConnection con,
+            List<(DataRow row, string result)> successWrites,
+            List<DataRow> successDeletes)
+        {
+            var allIds = new List<int>();
+            using (var tr = con.BeginTransaction())
+            {
+                try
+                {
+                    if (successWrites != null && successWrites.Count > 0)
+                    {
+                        var caseParts = successWrites.Select(x =>
+                        {
+                            int id = Convert.ToInt32(x.row["id_cardindev"]);
+                            string res = (x.result ?? "").Length > 100 ? (x.result ?? "").Substring(0, 100) : (x.result ?? "");
+                            res = res.Replace("'", "''");
+                            return $"when {id} then '{res}'";
+                        });
+                        var idStr = string.Join(",", successWrites.Select(x => Convert.ToInt32(x.row["id_cardindev"])));
+                        string caseExpr = "case cdx.id_cardindev " + string.Join(" ", caseParts) + " end";
+                        using (var cmd = new FbCommand($@"update cardidx cdx set cdx.load_time='now', cdx.load_result={caseExpr}, cdx.id_cardindev=null where cdx.id_cardindev in ({idStr})", con, tr))
+                            cmd.ExecuteNonQuery();
+                        allIds.AddRange(successWrites.Select(x => Convert.ToInt32(x.row["id_cardindev"])));
+                    }
+                    if (successDeletes != null) allIds.AddRange(successDeletes.Select(x => Convert.ToInt32(x["id_cardindev"])));
+                    if (allIds.Count == 0) { tr.Commit(); return; }
+                    var delIds = string.Join(",", allIds.Distinct());
+                    using (var cmd = new FbCommand($@"delete from cardindev cd where cd.id_cardindev in ({delIds})", con, tr))
+                        cmd.ExecuteNonQuery();
+                    tr.Commit();
+                }
+                catch { tr.Rollback(); throw; }
+            }
+        }
+
+        /// <summary>
+        /// Пакетное обновление cardidx (только для Write) и инкремент attempts (неуспешные записи/удаления).
+        /// failWrites — неуспешные записи (UpdateIdxCard + Increment). failDeletes — неуспешные удаления (только Increment).
+        /// </summary>
+        public static void BatchFail(FbConnection con,
+            List<(DataRow row, string result)> failWrites,
+            List<DataRow> failDeletes)
+        {
+            var allIds = new List<int>();
+            if (failWrites != null && failWrites.Count > 0)
+            {
+                var caseParts = failWrites.Select(x =>
+                {
+                    int id = Convert.ToInt32(x.row["id_cardindev"]);
+                    string res = (x.result ?? "").Length > 100 ? (x.result ?? "").Substring(0, 100) : (x.result ?? "");
+                    res = res.Replace("'", "''");
+                    return $"when {id} then '{res}'";
+                });
+                var idStr = string.Join(",", failWrites.Select(x => Convert.ToInt32(x.row["id_cardindev"])));
+                string caseExpr = "case cdx.id_cardindev " + string.Join(" ", caseParts) + " end";
+                using (var cmd = new FbCommand($@"update cardidx cdx set cdx.load_time='now', cdx.load_result={caseExpr} where cdx.id_cardindev in ({idStr})", con))
+                    cmd.ExecuteNonQuery();
+                allIds.AddRange(failWrites.Select(x => Convert.ToInt32(x.row["id_cardindev"])));
+            }
+            if (failDeletes != null) allIds.AddRange(failDeletes.Select(x => Convert.ToInt32(x["id_cardindev"])));
+            if (allIds.Count == 0) return;
+            var incIds = string.Join(",", allIds.Distinct());
+            using (var cmd = new FbCommand($@"update cardindev cd set cd.attempts=cd.attempts+1 where cd.id_cardindev in ({incIds})", con))
+                cmd.ExecuteNonQuery();
         }
 
 

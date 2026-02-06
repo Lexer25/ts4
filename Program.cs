@@ -9,6 +9,20 @@ using Serilog.Core;
 // Получаем версию из FileVersion
 var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "Unknown";
 
+// Глобальные обработчики необработанных исключений — программа не должна завершаться сама по себе
+AppDomain.CurrentDomain.UnhandledException += (sender, e) =>
+{
+    var ex = (Exception)e.ExceptionObject;
+    try { Serilog.Log.Fatal(ex, "Необработанное исключение в потоке: {Message}", ex?.Message); } catch { }
+    Console.WriteLine($"Необработанное исключение: {ex?.Message}");
+};
+TaskScheduler.UnobservedTaskException += (sender, e) =>
+{
+    try { Serilog.Log.Warning(e.Exception, "Необработанное исключение в Task: {Message}", e.Exception?.Message); } catch { }
+    Console.WriteLine($"Необработанное исключение в Task: {e.Exception?.Message}");
+    e.SetObserved();
+};
+
 // Обработка Ctrl+C для корректного завершения
 Console.CancelKeyPress += (sender, e) =>
 {
@@ -16,7 +30,7 @@ Console.CancelKeyPress += (sender, e) =>
     Console.WriteLine("\nПолучен сигнал завершения (Ctrl+C). Корректное завершение работы...");
 };
 
-// Проверка наличия процедуры и триггера в начале программы
+// Проверка наличия процедуры и триггера — один раз при запуске программы (в MainLine для каждого контроллера проверка не выполняется)
 try
 {
     var configuration = new ConfigurationBuilder()

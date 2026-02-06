@@ -25,8 +25,6 @@ namespace TS4
         private readonly TSMethods ts;
         private readonly string version;
         
-        // Семафор для предотвращения одновременного выполнения card_in_dev из разных потоков
-        private readonly SemaphoreSlim cardProcessingSemaphore = new SemaphoreSlim(5, 5);
         
         // Флаг для отслеживания обработки событий
         private volatile bool isProcessing = false;
@@ -40,6 +38,8 @@ namespace TS4
 
         private volatile bool isSubscribed = false;//переменная проверки подписки, которая благодаря volatile может измениться в любой момент, даже если код не делает явных изменений
         private readonly object subscriptionLock = new object();//объект синхронизации, который необходим для предотвращения гонки данных
+        private DateTime _lastSubscriptionCheck = DateTime.MinValue;
+        private const int SubscriptionCheckIntervalSec = 180; // проверка подписки раз в 3 мин (снижает нагрузку на fbserver от QueueEvents)
 
         public Worker4(ILogger<Worker4> logger, WorkerOptions options, Worker worker, TSMethods ts, string version)
         {
@@ -60,66 +60,87 @@ namespace TS4
 
             await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
 
-            // Таймер для периодической проверки подписки (каждые 2 минуты)
+            // Таймер для периодической проверки подписки (каждые 5 минут — реже = меньше нагрузка на fbserver)
             var subscriptionCheckTimer = new Timer(
                 async _ => await CheckAndReconnectSubscriptionAsync(),
                 null,
-                TimeSpan.FromMinutes(2),
-                TimeSpan.FromMinutes(2)
+                TimeSpan.FromMinutes(5),
+                TimeSpan.FromMinutes(5)
             );
 
-            try
+            // Внешний цикл: при любой критической ошибке не завершаем сервис — ждём и перезапускаем мониторинг
+            while (!stoppingToken.IsCancellationRequested)
             {
-                while (!stoppingToken.IsCancellationRequested)
+                try
                 {
-                    try
+                    bool cancelRequested = false;
+                    while (!stoppingToken.IsCancellationRequested && !cancelRequested)
                     {
-                        if (!isConnected)
-                        {
-                            await ConnectToEventMonitor();
-                        }
-                        else
-                        {
-                            // Периодически проверяем подписку каждые 30 секунд
-                            bool subscriptionActive = CheckSubscriptionStatus();
-                            if (!subscriptionActive && isConnected)
-                            {
-                                logger.LogWarning("Worker4: Подписка потеряна, пытаемся восстановить...");
-                                await ReconnectSubscriptionAsync();
-                            }
-                        }
-
-                        await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        // Корректное завершение работы - не логируем как ошибку
-                        logger.LogInformation("70 Worker4: Получен сигнал завершения работы");
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogError(ex, "75 Worker4: Ошибка при мониторинге событий: {Message}", ex.Message);
-                        isConnected = false;
-                        isSubscribed = false;
-
                         try
                         {
-                            await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
+                            if (!isConnected)
+                                await ConnectToEventMonitor();
+                            else if ((DateTime.UtcNow - _lastSubscriptionCheck).TotalSeconds >= SubscriptionCheckIntervalSec)
+                            {
+                                _lastSubscriptionCheck = DateTime.UtcNow;
+                                bool subscriptionActive = CheckSubscriptionStatus();
+                                if (!subscriptionActive)
+                                {
+                                    logger.LogWarning("Worker4: Подписка потеряна, пытаемся восстановить...");
+                                    await ReconnectSubscriptionAsync();
+                                }
+                            }
+                            await Task.Delay(TimeSpan.FromSeconds(60), stoppingToken);
                         }
                         catch (OperationCanceledException)
                         {
-                            // Корректное завершение работы - не логируем как ошибку
-                            logger.LogInformation("85 Worker4: Получен сигнал завершения работы");
-                            break;
+                            logger.LogInformation("70 Worker4: Получен сигнал завершения работы");
+                            cancelRequested = true;
                         }
+                        catch (Exception ex)
+                        {
+                            logger.LogError(ex, "75 Worker4: Ошибка при мониторинге событий: {Message}", ex.Message);
+                            isConnected = false;
+                            isSubscribed = false;
+                            try
+                            {
+                                await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                logger.LogInformation("85 Worker4: Получен сигнал завершения работы");
+                                cancelRequested = true;
+                            }
+                        }
+                    }
+                    logger.LogInformation("Worker4: Цикл мониторинга завершён (остановка или отмена)");
+                    break;
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    logger.LogCritical(ex, "Worker4: Критическая ошибка в цикле мониторинга. Перезапуск через 60 сек: {Message}", ex.Message);
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(60), stoppingToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
                     }
                 }
             }
-            finally
+
+            try
             {
-                // Очищаем таймер проверки подписки
                 await subscriptionCheckTimer.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Worker4: Ошибка при освобождении таймера подписки: {Message}", ex.Message);
             }
         }
 
@@ -314,17 +335,11 @@ namespace TS4
 
         private async Task ExecuteCardInDevAsync(string triggerContext, TimeSpan waitTimeout)
         {
-            if (!await cardProcessingSemaphore.WaitAsync(waitTimeout))
-            {
-                logger.LogWarning("227 Worker4: Не удалось получить доступ для запуска card_in_dev ({Context})", triggerContext);
-                return;
-            }
-
             try
             {
                 isProcessing = true;
                 logger.LogInformation("236 Worker4: Запуск card_in_dev (источник: {Context})", triggerContext);
-                card_in_dev();
+                await card_in_dev();
                 logger.LogInformation("246 Worker4: Завершен card_in_dev (источник: {Context})", triggerContext);
             }
             catch (Exception ex)
@@ -334,7 +349,6 @@ namespace TS4
             finally
             {
                 isProcessing = false;
-                cardProcessingSemaphore.Release();
             }
         }
 
@@ -397,9 +411,10 @@ namespace TS4
                                 return;
                             }
 
-                            await ExecuteCardInDevAsync("таймер простоя", TimeSpan.FromSeconds(1));
-                            
-                            // После автоматического запуска снова запускаем таймер
+                            // Запускаем card_in_dev без ожидания, чтобы поток таймера не блокировался.
+                            // Иначе при зависании card_in_dev (Access/Firebird) логи перестают писаться.
+                            _ = ExecuteCardInDevAsync("таймер простоя", TimeSpan.FromSeconds(30));
+                            // Сразу перезапускаем таймер — следующий запуск через N минут.
                             RestartTimeoutTimer();
                         }
                     }
@@ -436,7 +451,6 @@ namespace TS4
                     remoteEvent.RemoteEventCounts -= OnRemoteEventCounts;
                     remoteEvent.Dispose();
                 }
-                cardProcessingSemaphore?.Dispose();
             }
             catch (Exception ex)
             {
@@ -457,38 +471,53 @@ namespace TS4
         {
             try
             {
-                // 1) Читаем Access-таблицу устройств
-                // Добавляем дополнительную защиту от ошибок доступа к памяти
-                OleDbConnection? accCon = null;
+                logger.LogDebug("card_in_dev: начало");
+                // 1) Читаем Access-таблицу устройств (using — всегда освобождаем соединение, иначе «Недостаточно системных ресурсов»)
                 DataTable? table = null;
+                const int accessRetries = 2;
+                int attempt = 0;
 
-                try
+                while (attempt <= accessRetries)
                 {
-                    accCon = DBAccess.Connect(options.Access_db_config);
-                    accCon.Open();
-                    table = DBAccess.GetDevice(accCon);
-                    accCon.Close();
-                    accCon = null; // Указываем, что соединение уже закрыто
-                }
-                catch (System.AccessViolationException avEx)
-                {
-                    logger.LogError(avEx, "418 Worker4: Ошибка доступа к памяти при работе с Access DB: {Message}", avEx.Message);
-                    if (accCon != null)
+                    attempt++;
+                    try
                     {
-                        try { accCon.Close(); } catch { }
-                        accCon.Dispose();
+                        using (var accCon = DBAccess.Connect(options.Access_db_config))
+                        {
+                            accCon.Open();
+                            logger.LogDebug("card_in_dev: Access открыт, читаем устройства");
+                            table = DBAccess.GetDevice(accCon);
+                        }
+                        break;
                     }
-                    throw;
-                }
-                catch (Exception accEx)
-                {
-                    logger.LogError(accEx, "428 Worker4: Ошибка при подключении к Access DB: {Message}", accEx.Message);
-                    if (accCon != null)
+                    catch (System.AccessViolationException avEx)
                     {
-                        try { accCon.Close(); } catch { }
-                        accCon.Dispose();
+                        logger.LogError(avEx, "418 Worker4: Ошибка доступа к памяти при работе с Access DB: {Message}", avEx.Message);
+                        throw;
                     }
-                    throw;
+                    catch (System.Data.OleDb.OleDbException oleEx)
+                    {
+                        bool resourceError = (oleEx.Message ?? "").Contains("Недостаточно системных ресурсов", StringComparison.OrdinalIgnoreCase);
+                        logger.LogError(oleEx, "428 Worker4: Ошибка Access DB: {Message}", oleEx.Message);
+                        if (resourceError && attempt <= accessRetries)
+                        {
+                            logger.LogWarning("Worker4: Повтор через 30 сек (попытка {Attempt}/{Total})", attempt, accessRetries + 1);
+                            Thread.Sleep(30000);
+                            continue;
+                        }
+                        // Не пробрасываем дальше — сервис не должен завершаться из-за Access
+                        return;
+                    }
+                    catch (Exception accEx)
+                    {
+                        logger.LogError(accEx, "428 Worker4: Ошибка при подключении к Access DB: {Message}", accEx.Message);
+                        if (attempt <= accessRetries)
+                        {
+                            Thread.Sleep(5000);
+                            continue;
+                        }
+                        return;
+                    }
                 }
 
                 if (table == null)
@@ -509,7 +538,9 @@ namespace TS4
 
                 using (var conFB = DBFirebird.Connect(modifiedConnectionString, logger))
                 {
+                    logger.LogDebug("card_in_dev: подключаемся к Firebird");
                     conFB.Open();
+                    logger.LogDebug("card_in_dev: Firebird открыт, GetListForLoad");
                     var loadList = DBFirebird.GetListForLoad(conFB); // теперь (idDev, name)
 
                     // 3) Собираем итоговый список DEV по имени
@@ -521,29 +552,20 @@ namespace TS4
                         return;
                     }
 
-                    logger.LogInformation($"467 card_in_dev: устройств к обработке = {devs.Count}");
-
-                    // Добавьте логирование для отладки
-                    logger.LogInformation($"card_in_dev: Начинаем обработку устройств. Options.mode = {options.mode}");
-
-                    // Логируем каждое устройство перед обработкой
+                    // При запуске обработки в логах пишем список устройств и их количество (исходная логика)
+                    logger.LogInformation("467 card_in_dev: список устройств к обработке, количество = {Count}", devs.Count);
                     for (int i = 0; i < devs.Count; i++)
                     {
                         var dev = devs[i];
-                        logger.LogInformation($"Device #{i + 1}: Name={dev.controllerName}, Id={dev.id}");
+                        logger.LogInformation("  Устройство #{Num}: Name={Name}, Id={Id}, IP={Ip}", i + 1, dev.controllerName, dev.id, dev.ip);
                     }
-
-                    logger.LogInformation($"card_in_dev: устройств к обработке = {devs.Count}");
+                    logger.LogInformation("card_in_dev: режим = {Mode}, запускаем потоки для {Count} устройств (без ограничений)", options.mode, devs.Count);
 
                     if (options.mode.ToLower() == "async")
                     {
-                        // УБЕРИТЕ threads list и Thread.Join()!
-
                         for (int i = 0; i < devs.Count; i++)
                         {
                             var devLocal = devs[i];
-
-                            // Запускаем каждый поток и НЕ ЖДЕМ его завершения!
                             Thread thread = new Thread(() =>
                             {
                                 try
@@ -552,20 +574,17 @@ namespace TS4
                                 }
                                 catch (Exception ex)
                                 {
-                                    logger.LogDebug("card_in_dev thread error: " + ex);
+                                    logger.LogError(ex, "Worker4: Ошибка в потоке устройства {Name} IP {Ip}: {Message}", devLocal.controllerName, devLocal.ip, ex.Message);
                                 }
                             })
                             {
                                 Name = $"Worker4-{devLocal.controllerName}-{devLocal.ip}"
                             };
 
-                            thread.Start(); // Просто запускаем и забываем!
-                            logger.LogDebug($"Запущен поток для устройства: {devLocal.controllerName}");
+                            thread.Start();
                         }
 
-                        logger.LogInformation($"Запущено {devs.Count} потоков для обработки устройств");
-
-                        // НЕ ВЫЗЫВАЙТЕ Thread.Join()! Пусть потоки работают параллельно!
+                        logger.LogInformation("Запущено потоков: {Count}", devs.Count);
                     }
                     else
                     {
