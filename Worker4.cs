@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
@@ -52,13 +53,13 @@ namespace TS4
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            logger.LogInformation("50 Worker4 запущен - мониторинг событий Firebird через FbRemoteEvent");
-            logger.LogInformation($"51 Версия программы: {version}");
-
-            // Проверка наличия процедуры и триггера в начале программы
-            //await CheckDatabaseObjects(stoppingToken);
+            var workerStartSw = Stopwatch.StartNew();
+            const string timeFmt = "HH:mm:ss.fff";
+            logger.LogInformation("50 [время запуска {Time}] Worker4 запущен - мониторинг событий Firebird через FbRemoteEvent", DateTime.Now.ToString(timeFmt));
+            logger.LogInformation("51 Версия программы: {Version}", version);
 
             await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+            logger.LogInformation("52 [время запуска {Time}] [мс={ElapsedMs}] Worker4: задержка 1 сек завершена, подключаем FbRemoteEvent", DateTime.Now.ToString(timeFmt), workerStartSw.ElapsedMilliseconds);
 
             // Таймер для периодической проверки подписки (каждые 5 минут — реже = меньше нагрузка на fbserver)
             var subscriptionCheckTimer = new Timer(
@@ -99,7 +100,7 @@ namespace TS4
                         }
                         catch (Exception ex)
                         {
-                            logger.LogError(ex, "75 Worker4: Ошибка при мониторинге событий: {Message}", ex.Message);
+                            logger.LogError(ex, "75 Worker4: Ошибка при мониторинге событий: {Message}", LogHelper.Sanitize(ex.Message));
                             isConnected = false;
                             isSubscribed = false;
                             try
@@ -122,7 +123,7 @@ namespace TS4
                 }
                 catch (Exception ex)
                 {
-                    logger.LogCritical(ex, "Worker4: Критическая ошибка в цикле мониторинга. Перезапуск через 60 сек: {Message}", ex.Message);
+                    logger.LogCritical(ex, "Worker4: Критическая ошибка в цикле мониторинга. Перезапуск через 60 сек: {Message}", LogHelper.Sanitize(ex.Message));
                     try
                     {
                         await Task.Delay(TimeSpan.FromSeconds(60), stoppingToken);
@@ -140,7 +141,7 @@ namespace TS4
             }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "Worker4: Ошибка при освобождении таймера подписки: {Message}", ex.Message);
+                logger.LogWarning(ex, "Worker4: Ошибка при освобождении таймера подписки: {Message}", LogHelper.Sanitize(ex.Message));
             }
         }
 
@@ -148,10 +149,12 @@ namespace TS4
 
         private async Task<bool> ConnectToEventMonitor()
         {
+            const string timeFmt = "HH:mm:ss.fff";
+            var connectSw = Stopwatch.StartNew();
             try
             {
-                logger.LogInformation("96 Worker4: Подключение к FbRemoteEvent Firebird");
-                logger.LogInformation("97 Worker4: Connection string: {ConnStr}", options.Firebird_db_config);
+                logger.LogInformation("96 [время запуска {Time}] Worker4: Подключение к FbRemoteEvent Firebird (пик нагрузки на FB)", DateTime.Now.ToString(timeFmt));
+                logger.LogInformation("97 Worker4: Connection string: {ConnStr}", LogHelper.Sanitize(options.Firebird_db_config));
 
                 var connectionStringBuilder = new FbConnectionStringBuilder(options.Firebird_db_config);
                 if (connectionStringBuilder.Charset != null && connectionStringBuilder.Charset.ToUpper() != "UTF8")
@@ -160,30 +163,33 @@ namespace TS4
                 }
                 string connectionString = connectionStringBuilder.ToString();
 
-                logger.LogInformation("106 Worker4: Modified connection string: {ConnStr}", connectionString);
+                //remoteEvent = new FbRemoteEvent(connectionString);
+                //remoteEvent.RemoteEventCounts += OnRemoteEventCounts;
 
-                remoteEvent = new FbRemoteEvent(connectionString);
-                remoteEvent.RemoteEventCounts += OnRemoteEventCounts;
-
-                logger.LogInformation("111 Worker4: Открываем соединение...");
-                await Task.Run(() => remoteEvent.Open());
-                logger.LogInformation("113 Worker4: Соединение открыто");
+                logger.LogInformation("111 Worker4: FbRemoteEvent.Open()... (ожидаемая задержка до ~5 сек)");
+                var tOpen = connectSw.ElapsedMilliseconds;
+                //await Task.Run(() => remoteEvent.Open());
+                logger.LogInformation("113 Worker4: FbRemoteEvent.Open выполнен за {Ms} мс", connectSw.ElapsedMilliseconds - tOpen);
 
                 string[] eventsToMonitor = { "CARDINDEV_INSERT" };
 
-                logger.LogInformation("117 Worker4: Подписываемся на события...");
-                await Task.Run(() => remoteEvent.QueueEvents(eventsToMonitor));
-                logger.LogInformation("119 Worker4: Подписка активна");
+                logger.LogInformation("117 Worker4: QueueEvents(CARDINDEV_INSERT)...");
+                var tQueue = connectSw.ElapsedMilliseconds;
+                //await Task.Run(() => remoteEvent.QueueEvents(eventsToMonitor));
+                logger.LogInformation("119 Worker4: QueueEvents выполнен за {Ms} мс", connectSw.ElapsedMilliseconds - tQueue);
 
                 isConnected = true;
                 isSubscribed = true;
-                logger.LogInformation("122 Worker4: Успешно подключен к FbRemoteEvent Firebird");
+                logger.LogInformation("122 Worker4: Успешно подключен к FbRemoteEvent, всего на подключение {Ms} мс", connectSw.ElapsedMilliseconds);
                 
-                // Если run_now == true, запускаем card_in_dev один раз сразу без таймера
+                // Если run_now == true — пауза 4 сек, чтобы пик FB (Open событий) успел спасть до card_in_dev
                 if (options.run_now)
                 {
-                    logger.LogInformation("127 Worker4: run_now = true. Запускаем card_in_dev сразу после подключения");
+                    const int delaySec = 4;
+                    logger.LogInformation("127 Worker4: run_now = true. Пауза {Sec} сек перед card_in_dev", delaySec);
+                    await Task.Delay(TimeSpan.FromSeconds(delaySec));
                     await ExecuteCardInDevAsync("run_now", TimeSpan.FromSeconds(30));
+                    logger.LogInformation("128 Worker4: run_now card_in_dev завершён");
                 }
                 
                 // Запускаем таймер после успешного подключения (или после запуска при run_now)
@@ -192,7 +198,7 @@ namespace TS4
             }
             catch (Exception ex)
             {
-                logger.LogError(ex, "136 Worker4: Ошибка подключения к FbRemoteEvent: {Message}", ex.Message);
+                logger.LogError(ex, "136 Worker4: Ошибка подключения к FbRemoteEvent: {Message}", LogHelper.Sanitize(ex.Message));
                 isConnected = false;
                 isSubscribed = false;
 
@@ -226,7 +232,7 @@ namespace TS4
                     }
                     catch (Exception ex)
                     {
-                        logger.LogError(ex, "Worker4: Ошибка при восстановлении после получения события: {Message}", ex.Message);
+                        logger.LogError(ex, "Worker4: Ошибка при восстановлении после получения события: {Message}", LogHelper.Sanitize(ex.Message));
                     }
                 });
 
@@ -248,14 +254,14 @@ namespace TS4
                 {
                     logger.LogInformation("165 Worker4: Получено событие 'CARDINDEV_INSERT' от Firebird");
 
-                    // Устанавливаем флаг о срабатывании триггера
                     TriggerFired = true;
+
+                    // Сразу отменяем таймаут простоя — запуск по событию, таймер не должен срабатывать
+                    RestartTimeoutTimer();
 
                     await ExecuteCardInDevAsync("событие Firebird", TimeSpan.FromSeconds(1));
 
-
-
-                    // Перезапускаем таймер после обработки обоих запусков
+                    // После окончания обработки карт — заново запускаем таймер (следующий запуск через timeout при отсутствии событий)
                     RestartTimeoutTimer();
 
                     //if (remoteEvent != null && isConnected)
@@ -285,14 +291,14 @@ namespace TS4
                             }
                             catch (Exception ex)
                             {
-                                logger.LogWarning(ex, "Worker4: Ошибка при переподписке: {Message}", ex.Message);
+                                logger.LogWarning(ex, "Worker4: Ошибка при переподписке: {Message}", LogHelper.Sanitize(ex.Message));
                             }
                         }
                     }
                 }
                 catch (Exception ex)
                 {
-                    logger.LogError(ex, "192 Worker4: Ошибка обработки события: {Message}", ex.Message);
+                    logger.LogError(ex, "192 Worker4: Ошибка обработки события: {Message}", LogHelper.Sanitize(ex.Message));
                 }
                 finally
                 {
@@ -319,7 +325,7 @@ namespace TS4
                         }
                         catch (Exception ex)
                         {
-                            logger.LogError(ex, "Worker4: Ошибка при отключении от событий: {Message}", ex.Message);
+                            logger.LogError(ex, "Worker4: Ошибка при отключении от событий: {Message}", LogHelper.Sanitize(ex.Message));
                         }
                     }
                     isConnected = false;
@@ -327,7 +333,7 @@ namespace TS4
             }
             catch (Exception ex)
             {
-                logger.LogError(ex, "216 Worker4: Ошибка при отключении: {Message}", ex.Message);
+                logger.LogError(ex, "216 Worker4: Ошибка при отключении: {Message}", LogHelper.Sanitize(ex.Message));
             }
 
             await base.StopAsync(cancellationToken);
@@ -344,7 +350,7 @@ namespace TS4
             }
             catch (Exception ex)
             {
-                logger.LogError(ex, "250 Worker4: Ошибка при запуске card_in_dev ({Context}): {Message}", triggerContext, ex.Message);
+                logger.LogError(ex, "250 Worker4: Ошибка при запуске card_in_dev ({Context}): {Message}", triggerContext, LogHelper.Sanitize(ex.Message));
             }
             finally
             {
@@ -363,8 +369,8 @@ namespace TS4
                     timeoutTimerCts.Dispose();
                 }
 
-                // Парсим timeout из конфигурации (формат "H:M:S")
-                var timeoutParts = options.timeout.Split(':');
+                // Парсим timeout из конфигурации (формат "H:M:S" или "0:01:0" с ведущими нулями)
+                var timeoutParts = options.timeout.Split(':').Select(p => p.Trim()).ToArray();
                 if (timeoutParts.Length != 3)
                 {
                     logger.LogWarning("274 Worker4: Неверный формат timeout в конфигурации. Используется значение по умолчанию: 5 минут");
@@ -402,19 +408,16 @@ namespace TS4
                         // Если таймер не был отменен, значит не было новых событий - запускаем card_in_dev
                         if (!token.IsCancellationRequested)
                         {
-                            logger.LogInformation($"309 Worker4: Истек таймер ({timeoutDuration.TotalMinutes} минут). Событий не было. Запуск card_in_dev() автоматически.");
+                            logger.LogInformation("309 Worker4: Истек таймер ({TotalMin} мин). Запуск по таймауту.", timeoutDuration.TotalMinutes);
 
-                            // Проверяем, не обрабатывается ли уже событие
                             if (isProcessing)
                             {
-                                logger.LogDebug("314 Worker4: Пропускаем автоматический запуск - идет обработка события");
+                                logger.LogInformation("314 Worker4: Обработка карт ещё идёт — откладываем запуск по таймеру. Таймер перезапущен, следующий запуск через {TotalMin} мин.", timeoutDuration.TotalMinutes);
+                                RestartTimeoutTimer();
                                 return;
                             }
 
-                            // Запускаем card_in_dev без ожидания, чтобы поток таймера не блокировался.
-                            // Иначе при зависании card_in_dev (Access/Firebird) логи перестают писаться.
                             _ = ExecuteCardInDevAsync("таймер простоя", TimeSpan.FromSeconds(30));
-                            // Сразу перезапускаем таймер — следующий запуск через N минут.
                             RestartTimeoutTimer();
                         }
                     }
@@ -471,8 +474,10 @@ namespace TS4
         {
             try
             {
-                logger.LogDebug("card_in_dev: начало");
-                // 1) Читаем Access-таблицу устройств (using — всегда освобождаем соединение, иначе «Недостаточно системных ресурсов»)
+                const string timeFmt = "HH:mm:ss.fff";
+                var t0 = DateTime.Now;
+                logger.LogInformation("500 [время запуска {Time}] card_in_dev: Начало обработки карт (до MainLine), время выполнения: 0 мс", t0.ToString(timeFmt));
+
                 DataTable? table = null;
                 const int accessRetries = 2;
                 int attempt = 0;
@@ -482,12 +487,14 @@ namespace TS4
                     attempt++;
                     try
                     {
+                        var tAcc = DateTime.Now;
+                        logger.LogInformation("505 [время запуска {Time}] card_in_dev: Подключение к Access, GetDevice...", tAcc.ToString(timeFmt));
                         using (var accCon = DBAccess.Connect(options.Access_db_config))
                         {
                             accCon.Open();
-                            logger.LogDebug("card_in_dev: Access открыт, читаем устройства");
                             table = DBAccess.GetDevice(accCon);
                         }
+                        logger.LogInformation("510 [время запуска {Time}] card_in_dev: Чтение Access (устройства) завершено, время выполнения: {Ms:F0} мс", DateTime.Now.ToString(timeFmt), (DateTime.Now - tAcc).TotalMilliseconds);
                         break;
                     }
                     catch (System.AccessViolationException avEx)
@@ -527,42 +534,62 @@ namespace TS4
                 }
 
                 // 2) Читаем из Firebird пары (idDev, name)
-                // Исправляем строку подключения: используем UTF8 или корректную кодировку
                 var connectionStringBuilder = new FbConnectionStringBuilder(options.Firebird_db_config);
-                // Используем UTF8 для совместимости, можно также попробовать WIN1251 если UTF8 не работает
                 if (connectionStringBuilder.Charset != null && connectionStringBuilder.Charset.ToUpper() != "UTF8")
-                {
                     connectionStringBuilder.Charset = "UTF8";
+                // Максимальный размер пакета (Firebird: 512..32767) — меньше round-trip при GetListForLoad
+                const int packetSizeForLoad = 32767;
+                try
+                {
+                    connectionStringBuilder.PacketSize = packetSizeForLoad;
                 }
+                catch { /* свойство недоступно — подменим в строке */ }
                 string modifiedConnectionString = connectionStringBuilder.ToString();
+                if (modifiedConnectionString.IndexOf("Packet Size", StringComparison.OrdinalIgnoreCase) >= 0)
+                    modifiedConnectionString = System.Text.RegularExpressions.Regex.Replace(modifiedConnectionString, @"Packet\s*Size\s*=\s*\d+", $"Packet Size={packetSizeForLoad}", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                else
+                    modifiedConnectionString = modifiedConnectionString.TrimEnd(' ', ';') + "; Packet Size=" + packetSizeForLoad;
+
+                try
+                {
+                    var checkBuilder = new FbConnectionStringBuilder(modifiedConnectionString);
+                    logger.LogInformation("518 card_in_dev: Packet Size в строке подключения = {PacketSize}", checkBuilder.PacketSize);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogDebug("518 card_in_dev: не удалось прочитать Packet Size из строки: {Message}", ex.Message);
+                }
 
                 using (var conFB = DBFirebird.Connect(modifiedConnectionString, logger))
                 {
-                    logger.LogDebug("card_in_dev: подключаемся к Firebird");
+                    var tFbConn = DateTime.Now;
                     conFB.Open();
-                    logger.LogDebug("card_in_dev: Firebird открыт, GetListForLoad");
-                    var loadList = DBFirebird.GetListForLoad(conFB); // теперь (idDev, name)
+                    logger.LogInformation("520 card_in_dev: Подключение к Firebird, мс={Ms:F0}", (DateTime.Now - tFbConn).TotalMilliseconds);
 
-                    // 3) Собираем итоговый список DEV по имени
+                    var tLoadList = DateTime.Now;
+                    var loadList = DBFirebird.GetListForLoad(conFB);
+                    logger.LogInformation("530 card_in_dev: Firebird GetListForLoad (список контроллеров), мс={Ms:F0}, найдено={Count}", (DateTime.Now - tLoadList).TotalMilliseconds, loadList.Count);
+
+                    var tBuild = DateTime.Now;
                     var devs = Device.BuildFromAccessAndFirebird(table, loadList);
+                    logger.LogInformation("540 card_in_dev: Построение списка DEV (Access+Firebird), мс={Ms:F0}, устройств={Count}", (DateTime.Now - tBuild).TotalMilliseconds, devs.Count);
 
                     if (devs.Count == 0)
                     {
-                        logger.LogInformation("463 card_in_dev: нет карт для записи/удаления, очередь пуста");
+                        logger.LogInformation("545 card_in_dev: Нет карт для записи/удаления, очередь пуста");
                         return;
                     }
 
-                    // При запуске обработки в логах пишем список устройств и их количество (исходная логика)
-                    logger.LogInformation("467 card_in_dev: список устройств к обработке, количество = {Count}", devs.Count);
+                    logger.LogInformation("550 card_in_dev: Запуск потоков для {Count} устройств", devs.Count);
                     for (int i = 0; i < devs.Count; i++)
                     {
                         var dev = devs[i];
-                        logger.LogInformation("  Устройство #{Num}: Name={Name}, Id={Id}, IP={Ip}", i + 1, dev.controllerName, dev.id, dev.ip);
+                        logger.LogInformation("551 card_in_dev: Устройство #{Num} Name={Name} Id={Id} IP={Ip}", i + 1, dev.controllerName, dev.id, dev.ip);
                     }
-                    logger.LogInformation("card_in_dev: режим = {Mode}, запускаем потоки для {Count} устройств (без ограничений)", options.mode, devs.Count);
 
                     if (options.mode.ToLower() == "async")
                     {
+                        const int staggerMs = 450;
                         for (int i = 0; i < devs.Count; i++)
                         {
                             var devLocal = devs[i];
@@ -582,13 +609,15 @@ namespace TS4
                             };
 
                             thread.Start();
+                            if (i < devs.Count - 1)
+                                Thread.Sleep(staggerMs);
                         }
 
-                        logger.LogInformation("Запущено потоков: {Count}", devs.Count);
+                        logger.LogInformation("560 card_in_dev: MainLine запущен в {Count} потоках (интервал старта {StaggerMs} мс)", devs.Count, staggerMs);
                     }
                     else
                     {
-                        // Синхронно (если нужно)
+                        logger.LogInformation("555 [время запуска {Time}] card_in_dev: MainLine (sync) для {Count} устройств", DateTime.Now.ToString(timeFmt), devs.Count);
                         foreach (var dev in devs)
                         {
                             try
