@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Linq;
 using System.Text;
@@ -26,9 +27,14 @@ namespace TS4
         private readonly TSMethods ts;
         private readonly string version;
         
-        
-        // Флаг для отслеживания обработки событий
+        // Количество активных потоков MainLine (обработка устройств)
+        private int activeWorkers = 0;
+        // Устройства, для которых уже запущен поток MainLine (ключ: "Name|IP") — не запускать второй поток для того же устройства
+        private readonly ConcurrentDictionary<string, byte> _devicesInProgress = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+        // Флаг для отслеживания выполнения card_in_dev / обработки события
         private volatile bool isProcessing = false;
+        // Занятость: идёт card_in_dev или работает хотя бы один поток устройства
+        private bool IsBusy => isProcessing || activeWorkers > 0;
         
         // Таймер для автоматического запуска card_in_dev при отсутствии событий
         private CancellationTokenSource? timeoutTimerCts;
@@ -240,13 +246,13 @@ namespace TS4
             }
 
             // Запускаем обработку асинхронно, чтобы не блокировать поток события
-            // но используем семафор для предотвращения одновременных вызовов
+            // но используем флаг IsBusy для предотвращения одновременных запусков
             _ = Task.Run(async () =>
             {
-                // Если уже обрабатывается событие, пропускаем новое (debouncing)
-                if (isProcessing)
+                // Если уже идёт card_in_dev или работают потоки устройств, новое событие игнорируем
+                if (IsBusy)
                 {
-                    logger.LogDebug("151 Worker4: Событие получено, но обработка уже выполняется. Пропускаем.");
+                    logger.LogDebug("151 Worker4: Событие получено, но обработка уже выполняется (IsBusy=true). Пропускаем.");
                     return;
                 }
 
@@ -410,9 +416,9 @@ namespace TS4
                         {
                             logger.LogInformation("309 Worker4: Истек таймер ({TotalMin} мин). Запуск по таймауту.", timeoutDuration.TotalMinutes);
 
-                            if (isProcessing)
+                            if (IsBusy)
                             {
-                                logger.LogInformation("314 Worker4: Обработка карт ещё идёт — откладываем запуск по таймеру. Таймер перезапущен, следующий запуск через {TotalMin} мин.", timeoutDuration.TotalMinutes);
+                                logger.LogInformation("314 Worker4: Обработка уже идёт (IsBusy=true) — откладываем запуск по таймеру. Таймер перезапущен, следующий запуск через {TotalMin} мин.", timeoutDuration.TotalMinutes);
                                 RestartTimeoutTimer();
                                 return;
                             }
@@ -571,6 +577,9 @@ namespace TS4
                     logger.LogInformation("530 card_in_dev: Firebird GetListForLoad (список контроллеров), мс={Ms:F0}, найдено={Count}", (DateTime.Now - tLoadList).TotalMilliseconds, loadList.Count);
 
                     var tBuild = DateTime.Now;
+
+
+                    
                     var devs = Device.BuildFromAccessAndFirebird(table, loadList);
                     logger.LogInformation("540 card_in_dev: Построение списка DEV (Access+Firebird), мс={Ms:F0}, устройств={Count}", (DateTime.Now - tBuild).TotalMilliseconds, devs.Count);
 
@@ -593,8 +602,20 @@ namespace TS4
                         for (int i = 0; i < devs.Count; i++)
                         {
                             var devLocal = devs[i];
+                            string deviceKey = $"{devLocal.controllerName}|{devLocal.ip}";
+                            if (!_devicesInProgress.TryAdd(deviceKey, 0))
+                            {
+                                logger.LogInformation(
+                                    "552 Worker4: Пропуск устройства {Name} IP={Ip} — для него уже выполняется поток (повторный запуск card_in_dev)",
+                                    devLocal.controllerName, devLocal.ip);
+                                continue;
+                            }
                             Thread thread = new Thread(() =>
                             {
+                                int currentStarted = System.Threading.Interlocked.Increment(ref activeWorkers);
+                                logger.LogInformation(
+                                    "555 Worker4: Старт MainLine для устройства {Name} IP={Ip}, активных потоков={Count}",
+                                    devLocal.controllerName, devLocal.ip, currentStarted);
                                 try
                                 {
                                     ts.MainLine(devLocal, modifiedConnectionString);
@@ -602,6 +623,14 @@ namespace TS4
                                 catch (Exception ex)
                                 {
                                     logger.LogError(ex, "Worker4: Ошибка в потоке устройства {Name} IP {Ip}: {Message}", devLocal.controllerName, devLocal.ip, ex.Message);
+                                }
+                                finally
+                                {
+                                    _devicesInProgress.TryRemove(deviceKey, out _);
+                                    int currentFinished = System.Threading.Interlocked.Decrement(ref activeWorkers);
+                                    logger.LogInformation(
+                                        "556 Worker4: Завершение потока MainLine для устройства {Name} IP={Ip}, активных потоков={Count}",
+                                        devLocal.controllerName, devLocal.ip, currentFinished);
                                 }
                             })
                             {

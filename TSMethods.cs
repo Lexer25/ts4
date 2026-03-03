@@ -41,7 +41,7 @@ namespace TS4
 		{
 			if (string.IsNullOrEmpty(answer)) return false;
 			string a = answer.Trim().ToUpperInvariant();
-			return a.Contains("UDPRECV") || a.Contains("СВЯЗИ НЕТ");
+			return a.Contains("UDPRECV") || a.Contains("UDP RECV") || a.Contains("СВЯЗИ НЕТ") || a.Contains("ENETWORKERROR");
 		}
 
 		public TSMethods(ILogger<TSMethods> logger, WorkerOptions options)
@@ -147,7 +147,7 @@ namespace TS4
 			var tCom = DateTime.Now;
 			COM com = new COM(dev.driver, options);
 			com.SetupString(dev.ip);
-			bool reportOk = com.ReportStatus();
+			var (reportOk, reportMessage) = com.ReportStatusWithMessage();
 			if (reportOk)
 				logger.LogInformation("610 MainLine: COM создан, ReportStatus=Ok, мс={Ms:F0} для {Name} IP={Ip}", (DateTime.Now - tCom).TotalMilliseconds, dev.controllerName, dev.ip);
 
@@ -164,6 +164,12 @@ namespace TS4
 			else
 			{
 				logger.LogDebug("625 MainLine: Нет связи с контроллером {Name} IP={Ip}", dev.controllerName, dev.ip);
+				// reportMessage — ответ устройства (ReportStatus) или ex.Message; в load_result обрезается до 100 символов в DB
+				int updated = DBFirebird.UpdateCardIdxNoConnectionByControllerName(con, dev.controllerName, reportMessage);
+				if (updated > 0)
+					logger.LogInformation("626 MainLine: cardidx обновлён для контроллера {Name}, записей={Count}, load_result={Message}", dev.controllerName, updated, LogHelper.Sanitize(reportMessage));
+				else
+					logger.LogDebug("626 MainLine: cardidx для контроллера {Name} — обновлено 0 строк", dev.controllerName);
 			}
 		}
 		catch (FbException fbEx)
@@ -210,7 +216,7 @@ namespace TS4
 	private void OneDev(FbConnection con, DEV dev, COM com)
 	{
 		DateTime start = DateTime.Now;
-		logger.LogInformation("700 OneDev: Начало для {Name} IP={Ip}", dev.controllerName, dev.ip);
+		logger.LogInformation("700 OneDev: Начало потока для {Name} IP={Ip}", dev.controllerName, dev.ip);
 
 		if (con == null || con.State != ConnectionState.Open)
 		{
@@ -280,7 +286,9 @@ namespace TS4
 
 				if (IsNoConnectionAnswer(answer))
 				{
-					logger.LogWarning("735 OneDev: Нет связи с устройством (udprecv/связи нет). Ответ: {Answer}. Завершаем поток для {Name} IP={Ip}", LogHelper.Sanitize(answer), dev.controllerName, dev.ip);
+					// Ошибка udprecv/сети в процессе обработки команд — пишем ответ контроллера в load_result (формат ErrDesc="..."), завершаем поток
+					DBFirebird.UpdateCardIdxNoConnectionByControllerName(con, dev.controllerName, answer ?? "no connect");
+					logger.LogWarning("735 OneDev: Ошибка связи (udprecv/ENetworkError). Завершаем поток для {Name} IP={Ip}", dev.controllerName, dev.ip);
 					break;
 				}
 
@@ -311,18 +319,36 @@ namespace TS4
 			catch (System.IO.IOException ioEx)
 			{
 				logger.LogError(ioEx, "Ошибка сети при обработке команды для устройства: {Dev} IP: {Ip}. Соединение разорвано.", dev.controllerName, dev.ip);
+				// Обрыв связи при команде — записываем ошибку в cardidx и завершаем поток
+				DBFirebird.UpdateCardIdxNoConnectionByControllerName(con, dev.controllerName, ioEx.Message ?? "обрыв связи");
 				break;
 			}
 			catch (Exception ex)
 			{
 				logger.LogError(ex, "Общая ошибка при обработке команды для устройства: {Dev} IP: {Ip}. {Message}", dev.controllerName, dev.ip, LogHelper.Sanitize(ex.Message));
-				continue;
+				// Ошибка при выполнении команды — записываем в cardidx и завершаем поток
+				DBFirebird.UpdateCardIdxNoConnectionByControllerName(con, dev.controllerName, ex.Message ?? "ошибка");
+				break;
 			}
 		}
 
 		var loopTotalMs = (DateTime.Now - loopStart).TotalMilliseconds;
 		logger.LogInformation("750 OneDev: Цикл завершён {Name} IP={Ip} команд={Count} всего_мс={Ms:F0} ({PerSec:F1} карт/сек)", dev.controllerName, dev.ip, cmdIndex, loopTotalMs, cmdIndex > 0 ? cmdIndex * 1000.0 / loopTotalMs : 0);
 		logger.LogInformation("755 OneDev: Итого для устройства {Name} IP={Ip} мс={Ms:F0}", dev.controllerName, dev.ip, (DateTime.Now - start).TotalMilliseconds);
+
+		// После завершения обработки устройства явно разрываем соединение с БД
+		try
+		{
+			if (con != null && con.State == ConnectionState.Open)
+			{
+				con.Close();
+				logger.LogDebug("760 OneDev: Завершение потока, соединение с БД закрыто для {Name} IP={Ip}", dev.controllerName, dev.ip);
+			}
+		}
+		catch (Exception ex)
+		{
+			logger.LogDebug(ex, "761 OneDev: Ошибка завершения потока, ошибка при закрытии соединения для {Name} IP={Ip}: {Message}", dev.controllerName, dev.ip, LogHelper.Sanitize(ex.Message));
+		}
 		}
 
 	private string ComandBuilder(DataRow? row)
@@ -370,10 +396,10 @@ namespace TS4
 						{
 							var t1 = DateTime.Now;
 							DBFirebird.UpdateIdxCard(con, row, anser, true);
-							logger.LogDebug("760 AfterComand: UpdateIdxCard мс={Ms:F0}", (DateTime.Now - t1).TotalMilliseconds);
+							//logger.LogDebug("760 AfterComand: UpdateIdxCard мс={Ms:F0}", (DateTime.Now - t1).TotalMilliseconds);
 							var t2 = DateTime.Now;
 							DBFirebird.DeleteCardInDev(con, row);
-							logger.LogDebug("761 AfterComand: DeleteCardInDev мс={Ms:F0}", (DateTime.Now - t2).TotalMilliseconds);
+							//logger.LogDebug("761 AfterComand: DeleteCardInDev мс={Ms:F0}", (DateTime.Now - t2).TotalMilliseconds);
 						}
 						catch (FbException fbEx)
 						{
