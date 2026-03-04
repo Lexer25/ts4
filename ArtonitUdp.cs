@@ -84,7 +84,12 @@ namespace TS4
                 await udp.SendAsync(cmd, cmd.Length);
                 try
                 {
-                    var res = await udp.ReceiveAsync();
+                    const int receiveTimeoutMs = 3000;
+                    var receiveTask = udp.ReceiveAsync();
+                    var delayTask = Task.Delay(receiveTimeoutMs);
+                    if (await Task.WhenAny(receiveTask, delayTask) != receiveTask)
+                        return new Dictionary<string, int>();
+                    var res = await receiveTask;
                     var data = res.Buffer;
                     if (data.Length < 6) return new Dictionary<string, int>();
                     int headerLen = data[0];

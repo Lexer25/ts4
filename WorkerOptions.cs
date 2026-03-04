@@ -23,5 +23,7 @@ namespace TS4
         /// <summary>Задержка (мс) после каждой операции с Firebird внутри устройства. Увеличение распределяет нагрузку во времени, снижает пики — 800–1200.</summary>
         public int deviceCommandDelayMs { get; set; } = 1000;
         public string mode { get; set; } = "async";
+        /// <summary>Таймаут (сек) вызова драйвера (Execute/ReportStatus). По истечении вызов прерывается, программа не зависает. 0 = 60 сек.</summary>
+        public int DriverTimeoutSeconds { get; set; } = 60;
     }
 }

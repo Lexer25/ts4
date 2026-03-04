@@ -13,11 +13,13 @@ namespace TS4
 
         //public bool isTest = false;
         private readonly bool isTest;
+        private readonly int driverTimeoutSeconds;
 
         public COM(string uid, WorkerOptions options)
         {
             a = Activator.CreateInstance(Type.GetTypeFromCLSID(Guid.Parse(uid)));//load driver by guid
             isTest = options.IsTest;
+            driverTimeoutSeconds = options.DriverTimeoutSeconds > 0 ? options.DriverTimeoutSeconds : 60;
         }
         public dynamic Getcom()
         {
@@ -54,12 +56,11 @@ namespace TS4
                 Console.WriteLine("53 mode isTest is TRUE");
                 return "ERR";
             }
-            else
-            {
-                Console.WriteLine("58 mode isTest is FALSE");
-                //commands.Add(comand);//30.01.2025 вот это непонятно зачем. Надо проверить и убрать, если не нужен.
-                return a.Execute(comand);
-            }
+            var task = Task.Run(() => (string)a.Execute(comand));
+            if (task.Wait(TimeSpan.FromSeconds(driverTimeoutSeconds)))
+                return task.Result ?? "";
+            string raw = GetRawUdpResponseOrFallback(null);
+            return string.IsNullOrWhiteSpace(raw) ? "ERR TIMEOUT" : "ERR TIMEOUT " + raw;
         }
 
 
@@ -80,7 +81,13 @@ namespace TS4
                 return (true, "Yes");
             try
             {
-                string response = (string)a.Execute(@"ReportStatus");
+                var statusTask = Task.Run(() => (string)a.Execute(@"ReportStatus"));
+                if (!statusTask.Wait(TimeSpan.FromSeconds(driverTimeoutSeconds)))
+                {
+                    string rawTimeout = GetRawUdpResponseOrFallback(null);
+                    return (false, string.IsNullOrWhiteSpace(rawTimeout) ? "ERR TIMEOUT" : "ERR TIMEOUT " + rawTimeout);
+                }
+                string response = statusTask.Result ?? "";
                 if (string.IsNullOrEmpty(response))
                 {
                     string rawResp = GetRawUdpResponseOrFallback(null);
@@ -161,6 +168,12 @@ namespace TS4
             }
             catch { }
             return fallback ?? "no connect";
+        }
+
+        /// <summary>Возвращает последний сырой ответ драйвера/контроллера по UDP (для логирования при ошибках).</summary>
+        public string GetLastDriverResponse()
+        {
+            return GetRawUdpResponseOrFallback(null);
         }
     }
 }

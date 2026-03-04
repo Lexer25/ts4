@@ -36,12 +36,12 @@ namespace TS4
 			return msg.Contains("consistency check") || msg.Contains("bugcheck");
 		}
 
-		/// <summary>Ответ устройства указывает на отсутствие связи (udprecv, связи нет) — поток нужно завершить.</summary>
+		/// <summary>Ответ устройства указывает на отсутствие связи (udprecv, связи нет) или таймаут драйвера — поток нужно завершить.</summary>
 		private static bool IsNoConnectionAnswer(string? answer)
 		{
 			if (string.IsNullOrEmpty(answer)) return false;
 			string a = answer.Trim().ToUpperInvariant();
-			return a.Contains("UDPRECV") || a.Contains("UDP RECV") || a.Contains("СВЯЗИ НЕТ") || a.Contains("ENETWORKERROR");
+			return a.Contains("UDPRECV") || a.Contains("UDP RECV") || a.Contains("СВЯЗИ НЕТ") || a.Contains("ENETWORKERROR") || a.StartsWith("ERR TIMEOUT");
 		}
 
 		public TSMethods(ILogger<TSMethods> logger, WorkerOptions options)
@@ -163,7 +163,7 @@ namespace TS4
 			}
 			else
 			{
-				logger.LogDebug("625 MainLine: Нет связи с контроллером {Name} IP={Ip}", dev.controllerName, dev.ip);
+				logger.LogWarning("625 MainLine: Нет связи с контроллером {Name} IP={Ip}. Ответ контроллера по UDP: {Response}", dev.controllerName, dev.ip, LogHelper.Sanitize(reportMessage));
 				// reportMessage — ответ устройства (ReportStatus) или ex.Message; в load_result обрезается до 100 символов в DB
 				int updated = DBFirebird.UpdateCardIdxNoConnectionByControllerName(con, dev.controllerName, reportMessage);
 				if (updated > 0)
@@ -279,29 +279,45 @@ namespace TS4
 				var timeSincePrevMs = cmdIndex > 0 ? (cmdStartTime - cmdPrevTime).TotalMilliseconds : 0;
 
 				string operationType = ((int)cmd.dataRow["operation"] == 1) ? "Запись" : "Удаление";
+				string ToLogSafe(string s) => (s ?? "").Replace("\"", "'");
 
 				var tDevice = DateTime.Now;
-				string answer = com.ComandExecute(cmd.command);
-				var tDeviceMs = (DateTime.Now - tDevice).TotalMilliseconds;
-
-				if (IsNoConnectionAnswer(answer))
+				string answer = "";
+				bool udpErrorAfterRetry = false;
+				for (int attempt = 0; attempt <= 1; attempt++)
 				{
-					// Ошибка udprecv/сети в процессе обработки команд — пишем ответ контроллера в load_result (формат ErrDesc="..."), завершаем поток
-					DBFirebird.UpdateCardIdxNoConnectionByControllerName(con, dev.controllerName, answer ?? "no connect");
-					logger.LogWarning("735 OneDev: Ошибка связи (udprecv/ENetworkError). Завершаем поток для {Name} IP={Ip}", dev.controllerName, dev.ip);
+					answer = com.ComandExecute(cmd.command);
+
+					if (IsNoConnectionAnswer(answer))
+					{
+						if (attempt == 0)
+						{
+							logger.LogWarning("735 OneDev: Command: {Cmd} | Answer: {Ans} (Повторная попытка 1 раз)", ToLogSafe(cmd.command), ToLogSafe(answer));
+							continue;
+						}
+						udpErrorAfterRetry = true;
+						break;
+					}
 					break;
 				}
 
-				logger.LogInformation("730 OneDev: Команда #{Num} {Op} id_dev={Id} name={Name} reader={Reader} card={Card:l} IP={Ip} Command: {Cmd:l} | Answer: {Ans:l} | интервал_мс={PrevMs:F0} устройство_мс={DevMs:F0}",
-					cmdIndex + 1, operationType, cmd.dataRow["id_dev"], dev.controllerName, cmd.dataRow["id_reader"], LogHelper.Sanitize(cmd.dataRow["id_card"]?.ToString()), dev.ip, LogHelper.Sanitize(cmd.command), LogHelper.Sanitize(answer), timeSincePrevMs, tDeviceMs);
+				if (udpErrorAfterRetry)
+				{
+					DBFirebird.UpdateCardIdxNoConnectionByControllerName(con, dev.controllerName, answer ?? "no connect");
+					logger.LogWarning("735 OneDev: Command: {Cmd} | Answer: {Ans} (Завершаем поток)", ToLogSafe(cmd.command), ToLogSafe(answer));
+					break;
+				}
+
+				var tDeviceMs = (DateTime.Now - tDevice).TotalMilliseconds;
+				logger.LogInformation("730 OneDev: Command: {Cmd} | Answer: {Ans}", ToLogSafe(cmd.command), ToLogSafe(answer));
 
 				var tFb = DateTime.Now;
 				AfterComand(answer, con, cmd.dataRow, dev, operationType);
 				var tFbMs = (DateTime.Now - tFb).TotalMilliseconds;
-				logger.LogInformation("740 OneDev: Firebird AfterComand (UpdateIdxCard+DeleteCardInDev), мс={Ms:F0}", tFbMs);
+				//logger.LogInformation("740 OneDev: Firebird AfterComand (UpdateIdxCard+DeleteCardInDev), мс={Ms:F0}", tFbMs);
 
 				var cmdDurationMs = (DateTime.Now - cmdStartTime).TotalMilliseconds;
-				logger.LogInformation("745 OneDev: Команда #{Num} итого мс={Ms:F0} (устройство={Dev}мс + Firebird={Fb}мс)", cmdIndex + 1, cmdDurationMs, tDeviceMs, tFbMs);
+				//logger.LogInformation("745 OneDev: Команда #{Num} итого мс={Ms:F0} (устройство={Dev}мс + Firebird={Fb}мс)", cmdIndex + 1, cmdDurationMs, tDeviceMs, tFbMs);
 
 				cmdPrevTime = DateTime.Now;
 				cmdIndex++;
@@ -318,16 +334,26 @@ namespace TS4
 			}
 			catch (System.IO.IOException ioEx)
 			{
-				logger.LogError(ioEx, "Ошибка сети при обработке команды для устройства: {Dev} IP: {Ip}. Соединение разорвано.", dev.controllerName, dev.ip);
+				string driverResp = com.GetLastDriverResponse();
+				if (!string.IsNullOrWhiteSpace(driverResp))
+					logger.LogError(ioEx, "Ошибка сети при обработке команды для устройства: {Dev} IP: {Ip}. Ответ контроллера по UDP: {DriverResponse}", dev.controllerName, dev.ip, LogHelper.Sanitize(driverResp));
+				else
+					logger.LogError(ioEx, "Ошибка сети при обработке команды для устройства: {Dev} IP: {Ip}. Соединение разорвано.", dev.controllerName, dev.ip);
 				// Обрыв связи при команде — записываем ошибку в cardidx и завершаем поток
-				DBFirebird.UpdateCardIdxNoConnectionByControllerName(con, dev.controllerName, ioEx.Message ?? "обрыв связи");
+				string msgForDb = !string.IsNullOrWhiteSpace(driverResp) ? driverResp : (ioEx.Message ?? "обрыв связи");
+				DBFirebird.UpdateCardIdxNoConnectionByControllerName(con, dev.controllerName, msgForDb);
 				break;
 			}
 			catch (Exception ex)
 			{
-				logger.LogError(ex, "Общая ошибка при обработке команды для устройства: {Dev} IP: {Ip}. {Message}", dev.controllerName, dev.ip, LogHelper.Sanitize(ex.Message));
-				// Ошибка при выполнении команды — записываем в cardidx и завершаем поток
-				DBFirebird.UpdateCardIdxNoConnectionByControllerName(con, dev.controllerName, ex.Message ?? "ошибка");
+				string driverResp = com.GetLastDriverResponse();
+				if (!string.IsNullOrWhiteSpace(driverResp))
+					logger.LogError(ex, "Общая ошибка при обработке команды для устройства: {Dev} IP: {Ip}. Ответ контроллера по UDP: {DriverResponse}. Исключение: {Message}", dev.controllerName, dev.ip, LogHelper.Sanitize(driverResp), LogHelper.Sanitize(ex.Message));
+				else
+					logger.LogError(ex, "Общая ошибка при обработке команды для устройства: {Dev} IP: {Ip}. {Message}", dev.controllerName, dev.ip, LogHelper.Sanitize(ex.Message));
+				// Ошибка при выполнении команды — записываем в cardidx и завершаем поток (приоритет — ответ драйвера)
+				string msgForDb = !string.IsNullOrWhiteSpace(driverResp) ? driverResp : (ex.Message ?? "ошибка");
+				DBFirebird.UpdateCardIdxNoConnectionByControllerName(con, dev.controllerName, msgForDb);
 				break;
 			}
 		}
