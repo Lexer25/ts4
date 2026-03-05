@@ -8,25 +8,44 @@ using Newtonsoft.Json.Linq;
 using Serilog;
 using Serilog.Core;
 
-// Получаем версию из FileVersion
+// Версия из .csproj (свойство Version) — выводится при старте (Worker4, лог "51 Версия программы")
 var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "Unknown";
 
-// Путь к appsettings.json (сначала текущая папка, затем ProgramData/TS4)
+// Только один экземпляр программы (консоль и служба видят один и тот же Mutex)
+const string singleInstanceMutexName = "Global\\TS4_SingleInstance";
+using var singleInstanceMutex = new Mutex(initiallyOwned: true, singleInstanceMutexName, out bool createdNew);
+if (!createdNew)
+{
+    try
+    {
+        if (!singleInstanceMutex.WaitOne(0))
+        {
+            Console.WriteLine("Программа TS4 уже была запущена.");
+            Console.Write("Нажмите любую клавишу для выхода...");
+            Console.ReadKey(true);
+            Environment.Exit(1);
+        }
+    }
+    catch (AbandonedMutexException)
+    {
+        // Предыдущий процесс завершился без Release — владеем mutex
+    }
+}
+
+// Путь к appsettings.json: текущая папка, папка exe или ProgramData/TS4
 string programDataTs4Path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "TS4");
+string exeDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)
+    ?? AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
 string appsettingsPath = Path.Combine(Directory.GetCurrentDirectory(), "appsettings.json");
+string appsettingsPathInExeDir = Path.Combine(exeDir, "appsettings.json");
 string appsettingsProgramDataPath = Path.Combine(programDataTs4Path, "appsettings.json");
 
-// Содержимое appsettings.json по умолчанию (в ProgramData/TS4)
-string GetDefaultAppsettingsContent()
+// Содержимое appsettings.json по умолчанию (logFolder = папка для логов в настройках; если null — ProgramData/TS4)
+string GetDefaultAppsettingsContent(string? logFolder = null)
 {
-    string logPathEscaped = programDataTs4Path.Replace("\\", "\\\\");
+    string folder = logFolder ?? programDataTs4Path;
+    string logPathEscaped = folder.Replace("\\", "\\\\");
     return $@"{{
-  //уровень логирования журнала windows
-  ""Logging"": {{
-    ""EventLog"": {{ ""LogLevel"": {{ ""Default"": ""Critical"" }} }},
-    ""LogLevel"": {{ ""Default"": ""Trace"" }},
-    ""Console"": {{ ""LogLevel"": {{ ""Default"": ""Trace"" }} }}
-  }},
   ""Log"": {{
     // путь для логов
     ""LogFolerPath"": ""{logPathEscaped}"",
@@ -55,7 +74,7 @@ string GetDefaultAppsettingsContent()
 }}";
 }
 
-// Имя файла лога: TS4_yyyy-MM-dd.log
+// Имя файла лога: TS4_yyyy-MM-dd.log; новый файл каждый день — переключение в SerilogRollingHostedService
 static string GetLogFileName(string folder) =>
     Path.Combine(folder, $"TS4_{DateTime.Now:yyyy-MM-dd}.log");
 
@@ -106,34 +125,81 @@ var startupSw = Stopwatch.StartNew();
 var timeFmt = "HH:mm:ss.fff";
 Console.WriteLine("Старт программы. Время запуска: {0}. Логирование этапов включено.", DateTime.Now.ToString(timeFmt));
 
-// Проверка наличия и валидности appsettings.json (без исключений, с retry)
-IConfiguration configuration;
-while (true)
-{
-    string configPathToUse = appsettingsPath;
-    string configDirToUse = Directory.GetCurrentDirectory();
+// Режим службы Windows: не блокировать старт на проверках (иначе ошибка 1053 — таймаут запуска)
+bool isWindowsService = !Environment.UserInteractive;
 
-    if (!File.Exists(appsettingsPath))
+// Проверка наличия appsettings.json (ищем в текущей папке, в папке exe и в ProgramData — существующий не перезаписываем)
+string configPathToUse;
+string configDirToUse;
+if (File.Exists(appsettingsPath))
+{
+    configPathToUse = appsettingsPath;
+    configDirToUse = Directory.GetCurrentDirectory();
+}
+else if (File.Exists(appsettingsPathInExeDir))
+{
+    configPathToUse = appsettingsPathInExeDir;
+    configDirToUse = exeDir;
+}
+else if (File.Exists(appsettingsProgramDataPath))
+{
+    configPathToUse = appsettingsProgramDataPath;
+    configDirToUse = programDataTs4Path;
+}
+else
+{
+    // Файла нет ни в одной из папок — только тогда предлагаем создать
+    configPathToUse = appsettingsPath;
+    configDirToUse = Directory.GetCurrentDirectory();
+    if (isWindowsService)
     {
+        configPathToUse = appsettingsPathInExeDir;
+        configDirToUse = exeDir;
         try
         {
-            Directory.CreateDirectory(programDataTs4Path);
-            if (!File.Exists(appsettingsProgramDataPath))
-            {
-                File.WriteAllText(appsettingsProgramDataPath, GetDefaultAppsettingsContent());
-                Console.WriteLine($"Файл appsettings.json отсутствует. Создан по умолчанию: {appsettingsProgramDataPath}");
-            }
-            configPathToUse = appsettingsProgramDataPath;
-            configDirToUse = programDataTs4Path;
+            string logFolderForNewConfig = Path.Combine(exeDir, "log");
+            File.WriteAllText(configPathToUse, GetDefaultAppsettingsContent(logFolderForNewConfig));
         }
         catch (Exception ex)
         {
-            EnsureFallbackLogger($"Файл appsettings.json отсутствует. Ошибка создания: {ex.Message}", null, 5);
-            Thread.Sleep(5000);
-            continue;
+            Console.WriteLine("Служба: ошибка создания appsettings.json: " + ex.Message);
+            Environment.Exit(1);
         }
     }
+    else
+    {
+        Console.WriteLine("Файл appsettings.json не найден.");
+        Console.Write("Создать в текущей папке? (y/n): ");
+        string? answer = Console.ReadLine()?.Trim().ToLowerInvariant();
+        if (answer == "n")
+        {
+            Console.WriteLine("Завершение работы.");
+            Environment.Exit(0);
+        }
+        if (answer != "y")
+        {
+            Console.WriteLine("Введите y или n. Завершение работы.");
+            Environment.Exit(1);
+        }
+        try
+        {
+            string logFolderForNewConfig = Path.Combine(exeDir, "log");
+            File.WriteAllText(configPathToUse, GetDefaultAppsettingsContent(logFolderForNewConfig));
+            Console.WriteLine("Создан: " + configPathToUse);
+            Console.WriteLine("Папка логов в созданном конфиге: " + logFolderForNewConfig);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Ошибка создания файла: " + ex.Message);
+            Environment.Exit(1);
+        }
+    }
+}
 
+// Загрузка и валидация конфигурации (с retry при ошибке формата/загрузки)
+IConfiguration configuration;
+while (true)
+{
     try
     {
         var json = File.ReadAllText(configPathToUse);
@@ -205,6 +271,24 @@ static string? GetMdbPathFromAccessConfig(string? accessConfig)
     return null;
 }
 
+// Преобразование уровня из appsettings (Log:LogLevel) в уровень Serilog
+static Serilog.Events.LogEventLevel GetSerilogLevel(IConfiguration config)
+{
+    var minLevel = config.GetSection("Log").GetValue<LogLevel?>("LogLevel") ?? LogLevel.Information;
+    if (!Enum.IsDefined(typeof(LogLevel), minLevel))
+        minLevel = LogLevel.Information;
+    return minLevel switch
+    {
+        LogLevel.Trace => Serilog.Events.LogEventLevel.Verbose,
+        LogLevel.Debug => Serilog.Events.LogEventLevel.Debug,
+        LogLevel.Information => Serilog.Events.LogEventLevel.Information,
+        LogLevel.Warning => Serilog.Events.LogEventLevel.Warning,
+        LogLevel.Error => Serilog.Events.LogEventLevel.Error,
+        LogLevel.Critical => Serilog.Events.LogEventLevel.Fatal,
+        _ => Serilog.Events.LogEventLevel.Information
+    };
+}
+
 // Инициализация логгера из конфигурации (для фазы проверок до запуска Host)
 void EnsureConfigLogger(IConfiguration config)
 {
@@ -216,12 +300,14 @@ void EnsureConfigLogger(IConfiguration config)
         if (retainedFileCountLimit > 0)
             CleanupOldLogs(logFolderPath, retainedFileCountLimit);
 
-        string logPath = GetLogFileName(logFolderPath);
+        string logFile = GetLogFileName(logFolderPath);
+        var minLevel = GetSerilogLevel(config);
         Log.Logger = new LoggerConfiguration()
-            .MinimumLevel.Information()
-            .WriteTo.File(logPath,
+            .MinimumLevel.Is(minLevel)
+            .WriteTo.File(logFile,
                 outputTemplate: "{Timestamp:dd-MM-yyyy HH:mm:ss.fff}\t-\t[{Level:u3}] {Message}{NewLine}{Exception}",
-                flushToDiskInterval: TimeSpan.FromSeconds(1))
+                flushToDiskInterval: TimeSpan.FromSeconds(1),
+                retainedFileCountLimit: retainedFileCountLimit)
             .CreateLogger();
     }
     catch (Exception ex)
@@ -230,95 +316,103 @@ void EnsureConfigLogger(IConfiguration config)
     }
 }
 
-// Проверка связи с Firebird и наличия MDB (retry с задержкой из appsettings)
-bool appsettingsLogged = false;
-while (true)
+// Проверка связи с Firebird и MDB: в режиме службы не ждём (иначе таймаут 1053), проверки будут в Worker4
+if (isWindowsService)
 {
-    bool fbOk = false;
-    bool mdbOk = false;
-    int retryDelaySec = configuration.GetSection("Service").GetValue<int?>("retryDelaySeconds") ?? 5;
-
-    try
+    EnsureConfigLogger(configuration);
+    Log.Warning("105 [запуск мс={ElapsedMs}] appsettings.json загружен (режим службы — проверка Firebird/MDB в фоне)", startupSw.ElapsedMilliseconds);
+}
+else
+{
+    bool appsettingsLogged = false;
+    while (true)
     {
-        EnsureConfigLogger(configuration);
-        var options = configuration.GetSection("Service").Get<WorkerOptions>();
+        bool fbOk = false;
+        bool mdbOk = false;
+        int retryDelaySec = configuration.GetSection("Service").GetValue<int?>("retryDelaySeconds") ?? 5;
 
-        if (!appsettingsLogged)
+        try
         {
-            Log.Information("105 [запуск мс={ElapsedMs}] appsettings.json загружен, переходим к проверке Firebird и MDB", startupSw.ElapsedMilliseconds);
-            appsettingsLogged = true;
-        }
+            EnsureConfigLogger(configuration);
+            var options = configuration.GetSection("Service").Get<WorkerOptions>();
 
-        // 1. Проверка Firebird
-        Log.Information("108 [время запуска {Time}] [мс={ElapsedMs}] Проверка Firebird: начало", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
-        if (string.IsNullOrWhiteSpace(options?.Firebird_db_config))
-        {
-            Log.Warning("110 Нет настроек Firebird_db_config в appsettings.json. Повтор через {Delay} сек.", retryDelaySec);
-            Console.WriteLine($"Нет настроек Firebird в конфигурации. Повтор через {retryDelaySec} сек...");
-        }
-        else
-        {
-            try
+            if (!appsettingsLogged)
             {
-                var tFbCheck = startupSw.ElapsedMilliseconds;
-                var csBuilder = new FbConnectionStringBuilder(options.Firebird_db_config);
-                if (csBuilder.Charset != null && csBuilder.Charset.ToUpper() != "UTF8")
-                    csBuilder.Charset = "UTF8";
-                Log.Information("112 [запуск мс={ElapsedMs}] Firebird: создаём соединение (Connect)", startupSw.ElapsedMilliseconds);
-                using (var con = DBFirebird.Connect(csBuilder.ToString(), null))
-                {
-                    Log.Information("114 [запуск мс={ElapsedMs}] Firebird: Open()...", startupSw.ElapsedMilliseconds);
-                    con.Open();
-                    Log.Information("116 [запуск мс={ElapsedMs}] Firebird: Open выполнен за {Ms} мс", startupSw.ElapsedMilliseconds, startupSw.ElapsedMilliseconds - tFbCheck);
-                    con.Close();
-                    fbOk = true;
-                    Log.Information("120 [запуск мс={ElapsedMs}] Firebird: проверка пройдена, связь установлена", startupSw.ElapsedMilliseconds);
-                }
+                Log.Warning("105 [запуск мс={ElapsedMs}] appsettings.json загружен, переходим к проверке Firebird и MDB", startupSw.ElapsedMilliseconds);
+                appsettingsLogged = true;
             }
-            catch (Exception ex)
-            {
-                string msg = LogHelper.Sanitize(ex.Message);
-                Log.Warning("130 Нет связи с Firebird: {Message}. Повтор через {Delay} сек.", msg, retryDelaySec);
-                Console.WriteLine($"Нет связи с Firebird: {msg}. Повтор через {retryDelaySec} сек...");
-            }
-        }
 
-        Log.Information("125 [время запуска {Time}] [мс={ElapsedMs}] Проверка Firebird завершена, fbOk={FbOk}", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds, fbOk);
-        // 2. Проверка MDB (только если Firebird OK)
-        if (fbOk && !string.IsNullOrWhiteSpace(options?.Access_db_config))
-        {
-            string? mdbPath = GetMdbPathFromAccessConfig(options.Access_db_config);
-            if (string.IsNullOrEmpty(mdbPath))
+            // 1. Проверка Firebird
+            Log.Warning("108 [время запуска {Time}] [мс={ElapsedMs}] Проверка Firebird: начало", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
+            if (string.IsNullOrWhiteSpace(options?.Firebird_db_config))
             {
-                Log.Warning("140 Не удалось извлечь путь к MDB из Access_db_config. Повтор через {Delay} сек.", retryDelaySec);
-                Console.WriteLine($"Не найден путь к MDB в конфигурации. Повтор через {retryDelaySec} сек...");
-            }
-            else if (!File.Exists(mdbPath))
-            {
-                Log.Warning("150 Файл MDB отсутствует: {Path}. Повтор через {Delay} сек.", mdbPath, retryDelaySec);
-                Console.WriteLine($"Файл MDB отсутствует: {mdbPath}. Повтор через {retryDelaySec} сек...");
+                Log.Warning("110 Нет настроек Firebird_db_config в appsettings.json. Повтор через {Delay} сек.", retryDelaySec);
+                Console.WriteLine($"Нет настроек Firebird в конфигурации. Повтор через {retryDelaySec} сек...");
             }
             else
             {
-                mdbOk = true;
-                Log.Information("160 [запуск мс={ElapsedMs}] MDB: проверка пройдена, файл присутствует: {Path}", startupSw.ElapsedMilliseconds, mdbPath);
+                try
+                {
+                    var tFbCheck = startupSw.ElapsedMilliseconds;
+                    var csBuilder = new FbConnectionStringBuilder(options.Firebird_db_config);
+                    if (csBuilder.Charset != null && csBuilder.Charset.ToUpper() != "UTF8")
+                        csBuilder.Charset = "UTF8";
+                    Log.Warning("112 [запуск мс={ElapsedMs}] Firebird: создаём соединение (Connect)", startupSw.ElapsedMilliseconds);
+                    using (var con = DBFirebird.Connect(csBuilder.ToString(), null))
+                    {
+                        Log.Warning("114 [запуск мс={ElapsedMs}] Firebird: Open()...", startupSw.ElapsedMilliseconds);
+                        con.Open();
+                        Log.Warning("116 [запуск мс={ElapsedMs}] Firebird: Open выполнен за {Ms} мс", startupSw.ElapsedMilliseconds, startupSw.ElapsedMilliseconds - tFbCheck);
+                        con.Close();
+                        fbOk = true;
+                        Log.Warning("120 [запуск мс={ElapsedMs}] Firebird: проверка пройдена, связь установлена", startupSw.ElapsedMilliseconds);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    string msg = LogHelper.Sanitize(ex.Message);
+                    Log.Warning("130 Нет связи с Firebird: {Message}. Повтор через {Delay} сек.", msg, retryDelaySec);
+                    Console.WriteLine($"Нет связи с Firebird: {msg}. Повтор через {retryDelaySec} сек...");
+                }
+            }
+
+            Log.Warning("125 [время запуска {Time}] [мс={ElapsedMs}] Проверка Firebird завершена, fbOk={FbOk}", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds, fbOk);
+            // 2. Проверка MDB (только если Firebird OK)
+            if (fbOk && !string.IsNullOrWhiteSpace(options?.Access_db_config))
+            {
+                string? mdbPath = GetMdbPathFromAccessConfig(options.Access_db_config);
+                if (string.IsNullOrEmpty(mdbPath))
+                {
+                    Log.Warning("140 Не удалось извлечь путь к MDB из Access_db_config. Повтор через {Delay} сек.", retryDelaySec);
+                    Console.WriteLine($"Не найден путь к MDB в конфигурации. Повтор через {retryDelaySec} сек...");
+                }
+                else if (!File.Exists(mdbPath))
+                {
+                    Log.Warning("150 Файл MDB отсутствует: {Path}. Повтор через {Delay} сек.", mdbPath, retryDelaySec);
+                    Console.WriteLine($"Файл MDB отсутствует: {mdbPath}. Повтор через {retryDelaySec} сек...");
+                }
+                else
+                {
+                    mdbOk = true;
+                    Log.Warning("160 [запуск мс={ElapsedMs}] MDB: проверка пройдена, файл присутствует: {Path}", startupSw.ElapsedMilliseconds, mdbPath);
+                }
+            }
+            else if (fbOk && string.IsNullOrWhiteSpace(options?.Access_db_config))
+            {
+                Log.Warning("145 Нет настроек Access_db_config. Повтор через {Delay} сек.", retryDelaySec);
+                Console.WriteLine($"Нет настроек Access в конфигурации. Повтор через {retryDelaySec} сек...");
             }
         }
-        else if (fbOk && string.IsNullOrWhiteSpace(options?.Access_db_config))
+        catch (Exception ex)
         {
-            Log.Warning("145 Нет настроек Access_db_config. Повтор через {Delay} сек.", retryDelaySec);
-            Console.WriteLine($"Нет настроек Access в конфигурации. Повтор через {retryDelaySec} сек...");
+            EnsureFallbackLogger($"Ошибка при проверке: {ex.Message}", null, retryDelaySec);
         }
-    }
-    catch (Exception ex)
-    {
-        EnsureFallbackLogger($"Ошибка при проверке: {ex.Message}", null, retryDelaySec);
-    }
 
-    if (fbOk && mdbOk)
-        break;
+        if (fbOk && mdbOk)
+            break;
 
-    Thread.Sleep(retryDelaySec * 1000);
+        Thread.Sleep(retryDelaySec * 1000);
+    }
 }
 
 // Глобальные обработчики необработанных исключений — программа не должна завершаться сама по себе
@@ -343,7 +437,7 @@ Console.CancelKeyPress += (sender, e) =>
 };
 
 // Проверка наличия процедуры и триггера — один раз при запуске программы
-Log.Information("200 [время запуска {Time}] [мс={ElapsedMs}] Проверка объектов БД (процедура, триггер): начало", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
+Log.Warning("200 [время запуска {Time}] [мс={ElapsedMs}] Проверка объектов БД (процедура, триггер): начало", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
 try
 {
     WorkerOptions options = configuration.GetSection("Service").Get<WorkerOptions>();
@@ -351,7 +445,7 @@ try
     if (options != null && !string.IsNullOrEmpty(options.Firebird_db_config))
     {
         var tDbObj = startupSw.ElapsedMilliseconds;
-        Log.Information("202 [время запуска {Time}] [мс={ElapsedMs}] Проверка объектов БД: создаём второе соединение с Firebird", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
+        Log.Warning("202 [время запуска {Time}] [мс={ElapsedMs}] Проверка объектов БД: создаём второе соединение с Firebird", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
 
         var connectionStringBuilder = new FbConnectionStringBuilder(options.Firebird_db_config);
         if (connectionStringBuilder.Charset != null && connectionStringBuilder.Charset.ToUpper() != "UTF8")
@@ -364,26 +458,26 @@ try
         {
             try
             {
-                Log.Information("204 [время запуска {Time}] [мс={ElapsedMs}] Проверка объектов БД: Open()...", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
+                Log.Warning("204 [время запуска {Time}] [мс={ElapsedMs}] Проверка объектов БД: Open()...", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
                 con.Open();
-                Log.Information("206 [время запуска {Time}] [мс={ElapsedMs}] Проверка объектов БД: Open выполнен за {Ms} мс", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds, startupSw.ElapsedMilliseconds - tDbObj);
+                Log.Warning("206 [время запуска {Time}] [мс={ElapsedMs}] Проверка объектов БД: Open выполнен за {Ms} мс", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds, startupSw.ElapsedMilliseconds - tDbObj);
 
-                Log.Information("208 [время запуска {Time}] [мс={ElapsedMs}] Проверка процедуры CARDINDEV_TS4...", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
+                Log.Warning("208 [время запуска {Time}] [мс={ElapsedMs}] Проверка процедуры CARDINDEV_TS4...", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
                 bool procedureExists = DBFirebird.ProcedurChec(con);
-                Log.Information("210 [время запуска {Time}] [мс={ElapsedMs}] Процедура CARDINDEV_TS4: {Result}", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds, procedureExists ? "найдена" : "не найдена");
+                Log.Warning("210 [время запуска {Time}] [мс={ElapsedMs}] Процедура CARDINDEV_TS4: {Result}", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds, procedureExists ? "найдена" : "не найдена");
                 Console.WriteLine(procedureExists
                     ? "Проверка процедуры: процедура CARDINDEV_TS4 найдена в базе данных"
                     : "Проверка процедуры: процедура CARDINDEV_TS4 не найдена в базе данных\nЧтобы создать процедуру откройте файл \"C:\\TS4\\create procedure.bat\"");
 
-                Log.Information("212 [время запуска {Time}] [мс={ElapsedMs}] Проверка триггера CARDINDEV_AI0...", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
+                Log.Warning("212 [время запуска {Time}] [мс={ElapsedMs}] Проверка триггера CARDINDEV_AI0...", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
                 bool triggerExists = DBFirebird.TriggerCheck(con);
-                Log.Information("214 [время запуска {Time}] [мс={ElapsedMs}] Триггер CARDINDEV_AI0: {Result}", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds, triggerExists ? "найден" : "не найден");
+                Log.Warning("214 [время запуска {Time}] [мс={ElapsedMs}] Триггер CARDINDEV_AI0: {Result}", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds, triggerExists ? "найден" : "не найден");
                 Console.WriteLine(triggerExists
                     ? "Проверка триггера: триггер для события CARDINDEV_INSERT найден в базе данных"
                     : "Проверка триггера: триггер для события CARDINDEV_INSERT не найден в базе данных\nЧтобы создать триггер откройте файл \"C:\\TS4\\create trigger.bat\"");
 
                 con.Close();
-                Log.Information("220 [время запуска {Time}] [мс={ElapsedMs}] Проверка объектов БД завершена, соединение закрыто", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
+                Log.Warning("220 [время запуска {Time}] [мс={ElapsedMs}] Проверка объектов БД завершена, соединение закрыто", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
             }
             catch (Exception ex)
             {
@@ -398,7 +492,7 @@ catch (Exception ex)
     Console.WriteLine($"Ошибка при чтении конфигурации для проверки БД: {ex.Message}");
 }
 
-Log.Information("300 [запуск мс={ElapsedMs}] Host: создание билдера (CreateDefaultBuilder)...", startupSw.ElapsedMilliseconds);
+Log.Warning("300 [запуск мс={ElapsedMs}] Host: создание билдера (CreateDefaultBuilder)...", startupSw.ElapsedMilliseconds);
 try
 {
     IConfiguration configForHost = configuration;
@@ -434,42 +528,23 @@ try
             if (retainedFileCountLimit > 0)
                 CleanupOldLogs(logFolderPath, retainedFileCountLimit);
 
-            string logPath = GetLogFileName(logFolderPath);
-
-            LogLevel minLevel = context.Configuration.GetSection("Log").GetValue<LogLevel>("LogLevel");
-            if (!Enum.IsDefined(typeof(LogLevel), minLevel))
-                minLevel = LogLevel.Information;
-
-            var serilogLevel = minLevel switch
-            {
-                LogLevel.Trace => Serilog.Events.LogEventLevel.Verbose,
-                LogLevel.Debug => Serilog.Events.LogEventLevel.Debug,
-                LogLevel.Information => Serilog.Events.LogEventLevel.Information,
-                LogLevel.Warning => Serilog.Events.LogEventLevel.Warning,
-                LogLevel.Error => Serilog.Events.LogEventLevel.Error,
-                LogLevel.Critical => Serilog.Events.LogEventLevel.Fatal,
-                _ => Serilog.Events.LogEventLevel.Information
-            };
+            var serilogLevel = GetSerilogLevel(context.Configuration);
 
             var outputTemplate = "{Timestamp:dd-MM-yyyy HH:mm:ss.fff}\t-\t[{Level:u3}] {Message}{NewLine}{Exception}";
             configuration
                 .MinimumLevel.Is(serilogLevel)
-                .MinimumLevel.Override("Microsoft", Serilog.Events.LogEventLevel.Information)
-                .MinimumLevel.Override("Microsoft.Hosting.Lifetime", Serilog.Events.LogEventLevel.Information)
+                .MinimumLevel.Override("Microsoft", serilogLevel)
+                .MinimumLevel.Override("Microsoft.Hosting.Lifetime", serilogLevel)
                 .WriteTo.Console(outputTemplate: outputTemplate)
-                .WriteTo.Async(a => a.File(
-                    path: logPath,
-                    outputTemplate: outputTemplate,
-                    buffered: true,
-                    flushToDiskInterval: TimeSpan.FromSeconds(1)
-                ));
+                .WriteTo.Async(a => a.Sink(new DateRollingFileSink(logFolderPath)));
         })
         .UseWindowsService()
         .Build();
 
-    Log.Information("310 [время запуска {Time}] [мс={ElapsedMs}] Host: Build завершён", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
+    Log.Fatal("Старт программы. Время запуска: {Time}", DateTime.Now.ToString(timeFmt));
+    Log.Warning("310 [время запуска {Time}] [мс={ElapsedMs}] Host: Build завершён", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
     await host.StartAsync();
-    Log.Information("320 [время запуска {Time}] [мс={ElapsedMs}] Host: StartAsync завершён, Hosting started", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
+    Log.Warning("320 [время запуска {Time}] [мс={ElapsedMs}] Host: StartAsync завершён, Hosting started", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
     await host.WaitForShutdownAsync();
 }
 catch (OperationCanceledException)

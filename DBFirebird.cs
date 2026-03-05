@@ -518,7 +518,7 @@ and d2.""ACTIVE"">0";
                     using (var reader = cmd.ExecuteReader())
                     {
                         swExec.Stop();
-                        _logger?.LogInformation("360 GetListForLoad: ExecuteReader (курсор открыт), мс={Ms}", swExec.ElapsedMilliseconds);
+                        _logger?.LogWarning("360 GetListForLoad: ExecuteReader (курсор открыт), мс={Ms}", swExec.ElapsedMilliseconds);
 
                         var swRead = Stopwatch.StartNew();
                         while (reader.Read())
@@ -526,10 +526,10 @@ and d2.""ACTIVE"">0";
                             result.Add((reader.GetInt32(0), reader.IsDBNull(1) ? "" : reader.GetString(1)));
                         }
                         swRead.Stop();
-                        _logger?.LogInformation("368 GetListForLoad: цикл Read() до конца, мс={Ms}, строк={Count}", swRead.ElapsedMilliseconds, result.Count);
+                        _logger?.LogWarning("368 GetListForLoad: цикл Read() до конца, мс={Ms}, строк={Count}", swRead.ElapsedMilliseconds, result.Count);
                     }
                     swTotal.Stop();
-                    _logger?.LogInformation("370 GetListForLoad: всего мс={Ms}, строк в результате={Count}", swTotal.ElapsedMilliseconds, result.Count);
+                    _logger?.LogWarning("370 GetListForLoad: всего мс={Ms}, строк в результате={Count}", swTotal.ElapsedMilliseconds, result.Count);
                 }
                 catch (Exception ex)
                 {
