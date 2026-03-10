@@ -1,18 +1,13 @@
 <p>
-Инструкция по установке<br>
-Для работы Ts4 write key требуется<br>
-1 добавить процедуру cardindev_ts4 <br>
-1.1 исполните sql скрипт cardindev_ts4.sql <br>
-2 изменить ThreadingModel COM обьекта подробнне: https://learn.microsoft.com/en-us/windows/win32/com/inprocserver32 <br>
-2.1 Зайти в реестр <br>
-2.2 найти COM обьект по его CLSID - EAE30322-9FA6-4466-B3AE-DFB1D58813D3 <br>
-Примерный путь: (Компьютер\HKEY_LOCAL_MACHINE\SOFTWARE\Classes\WOW6432Node\CLSID\{EAE30322-9FA6-4466-B3AE-DFB1D58813D3}\InprocServer32) <br>
-2.2 изменить параметр ThreadingModel=Apartment <br>
-3 Настроить программу appsettings.json <br>
-4 запустить программу убедится в её корректной работе <br>
-5 Зарегистрировать как службу. <br>
-5.1 sc.exe create ts4w binpath=(путь до exe программы) <br>        
-<br>
-git https://github.com/Lexer25/ts4 <br>
-02.04.2025 Евскин И.В. http://artonit.ru/ 
+1. Запустить инсталлятор **TS4_setup.exe**.
+2. После установки необходимо запустить два BAT файла:
+   - **create trigger**
+   - **create procedure**
+3. Запустить программу **TS4.exe**.
+Запуск программы, как службы:
+1. Открыть командную строку (**cmd**) **от имени администратора** и ввести следующие команды:
+sc create TS4 binPath="<путь до исполняемого файла (TS4.exe)>" start=auto DisplayName=TS4 type=own
+sc description TS4 "Транспортный сервер СКУД Артонит"
+2. Открыть **Службы**, найти созданную службу по названию и запустить её.
+06.03.2026 Мурашов Т.А. http://artonit.ru/ 
 </p>

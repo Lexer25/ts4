@@ -32,13 +32,11 @@ if (!createdNew)
     }
 }
 
-// Путь к appsettings.json: текущая папка, папка exe или ProgramData/TS4
+// appsettings.json — только рядом с исполняемым файлом (нигде больше)
 string programDataTs4Path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "TS4");
 string exeDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)
     ?? AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-string appsettingsPath = Path.Combine(Directory.GetCurrentDirectory(), "appsettings.json");
-string appsettingsPathInExeDir = Path.Combine(exeDir, "appsettings.json");
-string appsettingsProgramDataPath = Path.Combine(programDataTs4Path, "appsettings.json");
+string appsettingsPath = Path.Combine(exeDir, "appsettings.json");
 
 // Содержимое appsettings.json по умолчанию (logFolder = папка для логов в настройках; если null — ProgramData/TS4)
 string GetDefaultAppsettingsContent(string? logFolder = null)
@@ -49,7 +47,12 @@ string GetDefaultAppsettingsContent(string? logFolder = null)
   ""Log"": {{
     // путь для логов
     ""LogFolerPath"": ""{logPathEscaped}"",
-    ""LogLevel"": ""Trace"",
+    //""LogLevel"": ""Debug"",
+    //""LogLevel"": ""Information"",
+    //""LogLevel"": ""Warning"",
+    //""LogLevel"": ""Error"",
+    //""LogLevel"": ""Trace"",
+    ""LogLevel"": ""Critical"",
     // количество лог файлов
     ""retainedFileCountLimit"": 7
   }},
@@ -100,8 +103,10 @@ void EnsureFallbackLogger(string reason, string? appsettingsUsedPath = null, int
     {
         try { Log.CloseAndFlush(); } catch { }
 
-        Directory.CreateDirectory(programDataTs4Path);
-        string logFile = GetLogFileName(programDataTs4Path);
+        string exeDirForFallback = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        string logFolderForFallback = Path.Combine(exeDirForFallback, "log");
+        Directory.CreateDirectory(logFolderForFallback);
+        string logFile = GetLogFileName(logFolderForFallback);
 
         Log.Logger = new LoggerConfiguration()
             .MinimumLevel.Information()
@@ -128,37 +133,19 @@ Console.WriteLine("Старт программы. Время запуска: {0}
 // Режим службы Windows: не блокировать старт на проверках (иначе ошибка 1053 — таймаут запуска)
 bool isWindowsService = !Environment.UserInteractive;
 
-// Проверка наличия appsettings.json (ищем в текущей папке, в папке exe и в ProgramData — существующий не перезаписываем)
-string configPathToUse;
-string configDirToUse;
-if (File.Exists(appsettingsPath))
+// Проверка: appsettings.json только рядом с exe. Нет — предлагаем создать там же (не удаляем и не трогаем другие папки)
+string configPathToUse = appsettingsPath;
+string configDirToUse = exeDir;
+
+if (!File.Exists(appsettingsPath))
 {
-    configPathToUse = appsettingsPath;
-    configDirToUse = Directory.GetCurrentDirectory();
-}
-else if (File.Exists(appsettingsPathInExeDir))
-{
-    configPathToUse = appsettingsPathInExeDir;
-    configDirToUse = exeDir;
-}
-else if (File.Exists(appsettingsProgramDataPath))
-{
-    configPathToUse = appsettingsProgramDataPath;
-    configDirToUse = programDataTs4Path;
-}
-else
-{
-    // Файла нет ни в одной из папок — только тогда предлагаем создать
-    configPathToUse = appsettingsPath;
-    configDirToUse = Directory.GetCurrentDirectory();
+    Console.WriteLine("Файл appsettings.json не найден рядом с программой.");
     if (isWindowsService)
     {
-        configPathToUse = appsettingsPathInExeDir;
-        configDirToUse = exeDir;
         try
         {
             string logFolderForNewConfig = Path.Combine(exeDir, "log");
-            File.WriteAllText(configPathToUse, GetDefaultAppsettingsContent(logFolderForNewConfig));
+            File.WriteAllText(appsettingsPath, GetDefaultAppsettingsContent(logFolderForNewConfig));
         }
         catch (Exception ex)
         {
@@ -168,8 +155,7 @@ else
     }
     else
     {
-        Console.WriteLine("Файл appsettings.json не найден.");
-        Console.Write("Создать в текущей папке? (y/n): ");
+        Console.Write("Создать appsettings.json рядом с программой? (y/n): ");
         string? answer = Console.ReadLine()?.Trim().ToLowerInvariant();
         if (answer == "n")
         {
@@ -184,9 +170,9 @@ else
         try
         {
             string logFolderForNewConfig = Path.Combine(exeDir, "log");
-            File.WriteAllText(configPathToUse, GetDefaultAppsettingsContent(logFolderForNewConfig));
-            Console.WriteLine("Создан: " + configPathToUse);
-            Console.WriteLine("Папка логов в созданном конфиге: " + logFolderForNewConfig);
+            File.WriteAllText(appsettingsPath, GetDefaultAppsettingsContent(logFolderForNewConfig));
+            Console.WriteLine("Создан: " + appsettingsPath);
+            Console.WriteLine("Папка логов в конфиге: " + logFolderForNewConfig);
         }
         catch (Exception ex)
         {
@@ -540,6 +526,27 @@ try
         })
         .UseWindowsService()
         .Build();
+
+    // Путь к exe (ProcessPath — .exe; при dotnet run или Location может быть .dll)
+    string exePath = Environment.ProcessPath ?? Assembly.GetExecutingAssembly().Location;
+    if (string.IsNullOrEmpty(exePath) || exePath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+        exePath = Path.Combine(exeDir, "TS4.exe");
+
+    string header1 = "Begin log: open application log";
+    string header2 = "Транспортный сервер TS4 для работы с контроллерами серии Artonit версия {Version}. Срок службы не ограничен. www.artonit.ru";
+    string header5 = "Регистрация службы";
+    string header6 = $"sc create TS4 binPath=\"{exePath}\" start=auto DisplayName=TS4 type=own";
+    string header7 = "sc description TS4 \"Транспортный сервер СКУД Артонит\"";
+
+    Console.WriteLine(header1);
+    Log.Fatal(header1);
+    Console.WriteLine($"Транспортный сервер TS4 для работы с контроллерами серии Artonit версия {version}");
+    Log.Fatal(header2, version);
+    Log.Fatal(header5);
+    Console.WriteLine(header6);
+    Log.Fatal(header6);
+    Console.WriteLine(header7);
+    Log.Fatal(header7);
 
     Log.Fatal("Старт программы. Время запуска: {Time}", DateTime.Now.ToString(timeFmt));
     Log.Warning("310 [время запуска {Time}] [мс={ElapsedMs}] Host: Build завершён", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);

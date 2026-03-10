@@ -392,7 +392,7 @@ namespace TS4
                 string timeFormat = estimatedRunTime.ToString("HH:mm:ss");
                 double totalMinutes = timeoutDuration.TotalMinutes;
                 
-                logger.LogCritical("294 Worker4: Таймер запущен. Автоматический запуск через {TotalMin} минут при отсутствии событий. Время следующего запуска: {TimeFormat}", totalMinutes, timeFormat);
+                logger.LogTrace("294 Worker4: Таймер запущен. Автоматический запуск через {TotalMin} минут при отсутствии событий. Время следующего запуска: {TimeFormat}", totalMinutes, timeFormat);
 
                 // Создаем новый таймер
                 timeoutTimerCts = new CancellationTokenSource();
@@ -466,6 +466,21 @@ namespace TS4
         
 
 
+        /// <summary>Вычисляет время следующего запуска по таймауту из конфига (формат H:M:S).</summary>
+        private static DateTime GetNextRunTimeFromTimeout(string timeout)
+        {
+            try
+            {
+                var parts = timeout.Split(':').Select(p => p.Trim()).ToArray();
+                if (parts.Length != 3) return DateTime.Now.AddMinutes(5);
+                int h = int.Parse(parts[0]);
+                int m = int.Parse(parts[1]);
+                int s = int.Parse(parts[2]);
+                return DateTime.Now.Add(new TimeSpan(h, m, s));
+            }
+            catch { return DateTime.Now.AddMinutes(5); }
+        }
+
         //1. Получить список контроллеров куда грузить карты GetListForLoad
         //2. Для каждого устройства собрать параметры для запуска.
         //3. Запустить Mainline в режиме async
@@ -487,7 +502,7 @@ namespace TS4
                     try
                     {
                         var tAcc = DateTime.Now;
-                        logger.LogCritical("505 [время запуска {Time}] card_in_dev: Подключение к Access, GetDevice...", tAcc.ToString(timeFmt));
+                        logger.LogTrace("505 [время запуска {Time}] card_in_dev: Подключение к Access, GetDevice...", tAcc.ToString(timeFmt));
                         using (var accCon = DBAccess.Connect(options.Access_db_config))
                         {
                             accCon.Open();
@@ -569,6 +584,8 @@ namespace TS4
                     var loadList = DBFirebird.GetListForLoad(conFB);
                     logger.LogWarning("530 card_in_dev: Firebird GetListForLoad (список контроллеров), мс={Ms:F0}, найдено={Count}", (DateTime.Now - tLoadList).TotalMilliseconds, loadList.Count);
 
+                    int totalCards = DBFirebird.GetTotalCardCountForLoad(conFB);
+
                     var tBuild = DateTime.Now;
 
 
@@ -578,9 +595,13 @@ namespace TS4
 
                     if (devs.Count == 0)
                     {
-                        logger.LogCritical("545 card_in_dev: Нет карт для записи/удаления, очередь пуста");
+                        DateTime nextRun = GetNextRunTimeFromTimeout(options.timeout);
+                        logger.LogCritical("545 Карт для удаления/записи 0. Время следующего запуска: {Time}", nextRun.ToString(timeFmt));
                         return;
                     }
+
+                    DateTime nextRunTime = GetNextRunTimeFromTimeout(options.timeout);
+                    logger.LogCritical("545 Карт для удаления/записи {Count}. Время следующего запуска: {Time}", totalCards, nextRunTime.ToString(timeFmt));
 
                     logger.LogInformation("550 card_in_dev: Запуск потоков для {Count} устройств", devs.Count);
                     for (int i = 0; i < devs.Count; i++)

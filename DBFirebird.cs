@@ -539,9 +539,29 @@ and d2.""ACTIVE"">0";
             return result;
         }
 
-        
-
-
+        /// <summary>
+        /// Возвращает общее количество карт для удаления/записи (строк в cardindev с теми же join/where, что и GetListForLoad).
+        /// </summary>
+        public static int GetTotalCardCountForLoad(FbConnection con)
+        {
+            const string sql = @"select count(*) from cardindev cd
+join device d on d.id_dev=cd.id_dev
+join device d2 on d2.id_ctrl=d.id_ctrl and d2.id_reader is null
+where d.""ACTIVE"">0 and d2.""ACTIVE"">0";
+            try
+            {
+                using (var cmd = new FbCommand(sql, con))
+                {
+                    var obj = cmd.ExecuteScalar();
+                    return obj != null && obj != DBNull.Value ? Convert.ToInt32(obj) : 0;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogDebug("GetTotalCardCountForLoad: {Message}", LogHelper.Sanitize(ex.Message));
+                return 0;
+            }
+        }
 
     }
 }

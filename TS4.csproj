@@ -7,7 +7,7 @@
     <UserSecretsId>dotnet-TS4-54869e89-5562-4c18-85cf-84a78ae9ec5f</UserSecretsId>
     <DockerDefaultTargetOS>Windows</DockerDefaultTargetOS>
     <Platforms>AnyCPU;x86</Platforms>
-    <Version>1.0.3.6</Version>
+    <Version>1.0.3.7</Version>
     <AssemblyVersion>$(Version)</AssemblyVersion>
     <FileVersion>$(Version)</FileVersion>
   </PropertyGroup>

@@ -314,7 +314,7 @@ namespace TS4
 					{
 						if (attempt == 0)
 						{
-							logger.LogWarning("735 OneDev: Command: {Cmd} | Answer: {Ans} (Повторная попытка 1 раз)", ToLogSafe(cmd.command), ToLogSafe(answer));
+							logger.LogWarning("735 OneDev: Device={Device} Транспортный сервер=TS4 Command: {Cmd} | Answer: {Ans} (Повторная попытка 1 раз)", dev.controllerName, ToLogSafe(cmd.command), ToLogSafe(answer));
 							continue;
 						}
 						udpErrorAfterRetry = true;
@@ -326,12 +326,12 @@ namespace TS4
 				if (udpErrorAfterRetry)
 				{
 					DBFirebird.UpdateCardIdxNoConnectionByControllerName(con, dev.controllerName, answer ?? "no connect");
-					logger.LogWarning("735 OneDev: Command: {Cmd} | Answer: {Ans} (Завершаем поток)", ToLogSafe(cmd.command), ToLogSafe(answer));
+					logger.LogWarning("735 OneDev: Device={Device} Транспортный сервер=TS4 Command: {Cmd} | Answer: {Ans} (Завершаем поток)", dev.controllerName, ToLogSafe(cmd.command), ToLogSafe(answer));
 					break;
 				}
 
 				var tDeviceMs = (DateTime.Now - tDevice).TotalMilliseconds;
-				logger.LogCritical("730 OneDev: Command: {Cmd} | Answer: {Ans}", ToLogSafe(cmd.command), ToLogSafe(answer));
+				logger.LogCritical("730 OneDev: Device={Device} Транспортный сервер=TS4 Command: {Cmd} | Answer: {Ans}", dev.controllerName, ToLogSafe(cmd.command), ToLogSafe(answer));
 
 				var tFb = DateTime.Now;
 				AfterComand(answer, con, cmd.dataRow, dev, operationType);
