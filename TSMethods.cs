@@ -329,11 +329,20 @@ namespace TS4
 					logger.LogWarning("735 OneDev: Device={Device} Транспортный сервер=TS4 Command: {Cmd} | Answer: {Ans} (Завершаем поток)", dev.controllerName, ToLogSafe(cmd.command), ToLogSafe(answer));
 					break;
 				}
-
+				
 				var tDeviceMs = (DateTime.Now - tDevice).TotalMilliseconds;
 				logger.LogCritical("730 OneDev: Device={Device} Транспортный сервер=TS4 Command: {Cmd} | Answer: {Ans}", dev.controllerName, ToLogSafe(cmd.command), ToLogSafe(answer));
 
-				var tFb = DateTime.Now;
+                    //01.06.2026 - проверка ответа на код 1
+                    if (answer.Contains("code is 1"))
+                    {
+                        DBFirebird.UpdateCardIdxNoConnectionByControllerName(con, dev.controllerName, answer ?? "code is 1");
+						con.Close();
+                        return;
+                    }
+
+
+                    var tFb = DateTime.Now;
 				AfterComand(answer, con, cmd.dataRow, dev, operationType);
 				var tFbMs = (DateTime.Now - tFb).TotalMilliseconds;
 				logger.LogWarning("740 OneDev: Firebird AfterComand (UpdateIdxCard+DeleteCardInDev), мс={Ms:F0}", tFbMs);

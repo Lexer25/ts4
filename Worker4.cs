@@ -26,7 +26,7 @@ namespace TS4
         private bool isConnected = false;
         private readonly TSMethods ts;
         private readonly string version;
-        
+
         // Количество активных потоков MainLine (обработка устройств)
         private int activeWorkers = 0;
         // Устройства, для которых уже запущен поток MainLine (ключ: "Name|IP") — не запускать второй поток для того же устройства
@@ -35,18 +35,30 @@ namespace TS4
         private volatile bool isProcessing = false;
         // Занятость: идёт card_in_dev или работает хотя бы один поток устройства
         private bool IsBusy => isProcessing || activeWorkers > 0;
-        
+
         // Таймер для автоматического запуска card_in_dev при отсутствии событий
         private CancellationTokenSource? timeoutTimerCts;
         private readonly object timeoutTimerLock = new object();
         private Task? timeoutTimerTask;
 
-        //08.12.2025 - добавлены две переменные
-
-        private volatile bool isSubscribed = false;//переменная проверки подписки, которая благодаря volatile может измениться в любой момент, даже если код не делает явных изменений
-        private readonly object subscriptionLock = new object();//объект синхронизации, который необходим для предотвращения гонки данных
+        // Переменные для управления подпиской
+        private volatile bool isSubscribed = false;
+        private readonly object subscriptionLock = new object();
         private DateTime _lastSubscriptionCheck = DateTime.MinValue;
-        private const int SubscriptionCheckIntervalSec = 180; // проверка подписки раз в 3 мин (снижает нагрузку на fbserver от QueueEvents)
+        private const int SubscriptionCheckIntervalSec = 180; // проверка подписки раз в 3 мин
+
+        // Переменные для отслеживания состояния
+        private volatile bool _isShuttingDown = false;
+        private int _consecutiveCheckFailures = 0;
+        private DateTime _lastSuccessfulCheck = DateTime.Now;
+
+        // НЕЗАВИСИМЫЙ МОНИТОР СОЕДИНЕНИЯ
+        private Task? _connectionMonitorTask;
+        private CancellationTokenSource? _connectionMonitorCts;
+        private readonly object _monitorLock = new object();
+        private const int ConnectionCheckIntervalSeconds = 300; // 5 минут
+        private int _consecutiveConnectionFailures = 0;
+        private const int MaxConnectionFailures = 3;
 
         public Worker4(ILogger<Worker4> logger, WorkerOptions options, Worker worker, TSMethods ts, string version)
         {
@@ -64,24 +76,37 @@ namespace TS4
             logger.LogCritical("50 [время запуска {Time}] Worker4 запущен - мониторинг событий Firebird через FbRemoteEvent", DateTime.Now.ToString(timeFmt));
             logger.LogCritical("51 Версия программы: {Version}", version);
 
-            await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
-            logger.LogWarning("52 [время запуска {Time}] [мс={ElapsedMs}] Worker4: задержка 1 сек завершена, подключаем FbRemoteEvent", DateTime.Now.ToString(timeFmt), workerStartSw.ElapsedMilliseconds);
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+            }
+            catch (OperationCanceledException e)
+            {
+                logger.LogWarning(e, "Message={Message}, IsCancellationRequested={IsCancelled}",
+                    e.Message,
+                    stoppingToken.IsCancellationRequested);
+            }
+            logger.LogWarning("52 [время запуска {Time}] [мс={ElapsedMs}] Worker4: задержка 1 сек завершена, подключаем FbRemoteEvent",
+                DateTime.Now.ToString(timeFmt), workerStartSw.ElapsedMilliseconds);
 
-            // Таймер для периодической проверки подписки (каждые 5 минут — реже = меньше нагрузка на fbserver)
+            // ЗАПУСКАЕМ НЕЗАВИСИМЫЙ МОНИТОРИНГ СОЕДИНЕНИЯ
+            StartIndependentConnectionMonitor(stoppingToken);
+
+            // Таймер для периодической проверки подписки (увеличен интервал)
             var subscriptionCheckTimer = new Timer(
-                async _ => await CheckAndReconnectSubscriptionAsync(),
+                async _ => await CheckAndReconnectSubscriptionSafeAsync(),
                 null,
-                TimeSpan.FromMinutes(5),
-                TimeSpan.FromMinutes(5)
+                TimeSpan.FromMinutes(10),
+                TimeSpan.FromMinutes(10)
             );
 
             // Внешний цикл: при любой критической ошибке не завершаем сервис — ждём и перезапускаем мониторинг
-            while (!stoppingToken.IsCancellationRequested)
+            while (!stoppingToken.IsCancellationRequested && !_isShuttingDown)
             {
                 try
                 {
                     bool cancelRequested = false;
-                    while (!stoppingToken.IsCancellationRequested && !cancelRequested)
+                    while (!stoppingToken.IsCancellationRequested && !cancelRequested && !_isShuttingDown)
                     {
                         try
                         {
@@ -90,11 +115,24 @@ namespace TS4
                             else if ((DateTime.UtcNow - _lastSubscriptionCheck).TotalSeconds >= SubscriptionCheckIntervalSec)
                             {
                                 _lastSubscriptionCheck = DateTime.UtcNow;
-                                bool subscriptionActive = CheckSubscriptionStatus();
+
+                                // Пропускаем проверку, если идёт обработка или недавно была успешная проверка
+                                if (IsBusy || (DateTime.Now - _lastSuccessfulCheck).TotalMinutes < 2)
+                                {
+                                    logger.LogDebug("Worker4: Пропуск проверки подписки (IsBusy={IsBusy})", IsBusy);
+                                    continue;
+                                }
+
+                                bool subscriptionActive = CheckSubscriptionStatusSafe();
                                 if (!subscriptionActive)
                                 {
                                     logger.LogWarning("Worker4: Подписка потеряна, пытаемся восстановить...");
                                     await ReconnectSubscriptionAsync();
+                                }
+                                else
+                                {
+                                    _lastSuccessfulCheck = DateTime.Now;
+                                    _consecutiveCheckFailures = 0;
                                 }
                             }
                             await Task.Delay(TimeSpan.FromSeconds(60), stoppingToken);
@@ -141,6 +179,9 @@ namespace TS4
                 }
             }
 
+            // ОСТАНАВЛИВАЕМ НЕЗАВИСИМЫЙ МОНИТОР СОЕДИНЕНИЯ
+            StopIndependentConnectionMonitor();
+
             try
             {
                 await subscriptionCheckTimer.DisposeAsync();
@@ -151,7 +192,223 @@ namespace TS4
             }
         }
 
+        #region НЕЗАВИСИМЫЙ МОНИТОР СОЕДИНЕНИЯ
 
+        /// <summary>
+        /// Запускает независимый монитор соединения в отдельном Task
+        /// </summary>
+        private void StartIndependentConnectionMonitor(CancellationToken stoppingToken)
+        {
+            lock (_monitorLock)
+            {
+                if (_connectionMonitorTask != null && !_connectionMonitorTask.IsCompleted)
+                {
+                    logger.LogWarning("Worker4: Монитор соединения уже запущен");
+                    return;
+                }
+
+                _connectionMonitorCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+                var token = _connectionMonitorCts.Token;
+
+                _connectionMonitorTask = Task.Run(async () =>
+                {
+                    logger.LogCritical("1050 Worker4: [МОНИТОР] ЗАПУЩЕН НЕЗАВИСИМЫЙ МОНИТОР СОЕДИНЕНИЯ");
+
+                    // Первая проверка через 30 секунд
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(30), token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        logger.LogInformation("1055 Worker4: [МОНИТОР] Отмена перед первой проверкой");
+                        return;
+                    }
+
+                    while (!token.IsCancellationRequested && !_isShuttingDown)
+                    {
+                        try
+                        {
+                            logger.LogDebug("1060 Worker4: [МОНИТОР] Запуск проверки соединения...");
+
+                            // Проверяем соединение с БД
+                            bool isConnectedOk = await CheckDatabaseConnectionSafeAsync();
+
+                            if (isConnectedOk)
+                            {
+                                logger.LogInformation("1065 Worker4: [МОНИТОР] Соединение с Firebird УСПЕШНО");
+                                _consecutiveConnectionFailures = 0;
+                                _lastSuccessfulCheck = DateTime.Now;
+
+                                // Если соединение восстановилось, но флаг isConnected false - исправляем
+                                if (!isConnected)
+                                {
+                                    logger.LogWarning("1070 Worker4: [МОНИТОР] Соединение восстановлено, но флаг isConnected=false. Восстанавливаем подписку...");
+                                    isConnected = true;
+                                    await ReconnectSubscriptionAsync();
+                                }
+                                else if (!isSubscribed)
+                                {
+                                    // Проверяем и восстанавливаем подписку, если она потеряна
+                                    logger.LogWarning("1071 Worker4: [МОНИТОР] Соединение есть, но подписка потеряна. Восстанавливаем...");
+                                    await ReconnectSubscriptionAsync();
+                                }
+                                else
+                                {
+                                    // Дополнительная проверка подписки - отправляем тестовый запрос
+                                    bool subscriptionActive = CheckSubscriptionStatusSafe();
+                                    if (!subscriptionActive)
+                                    {
+                                        logger.LogWarning("1072 Worker4: [МОНИТОР] Подписка неактивна. Пересоздаём...");
+                                        await ReconnectSubscriptionAsync();
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                logger.LogWarning("1075 Worker4: [МОНИТОР] Соединение с Firebird НЕУДАЧНО");
+                                _consecutiveConnectionFailures++;
+
+                                // Если несколько неудачных проверок подряд - пробуем восстановить
+                                if (_consecutiveConnectionFailures >= MaxConnectionFailures)
+                                {
+                                    logger.LogCritical("1080 Worker4: [МОНИТОР] {Failures} неудачных проверок подряд. Принудительное восстановление...",
+                                        _consecutiveConnectionFailures);
+
+                                    // Сбрасываем состояние
+                                    isConnected = false;
+                                    isSubscribed = false;
+
+                                    // Пытаемся переподключиться
+                                    bool reconnected = await ReconnectSubscriptionAsync();
+
+                                    if (reconnected)
+                                    {
+                                        logger.LogInformation("1085 Worker4: [МОНИТОР] Соединение успешно восстановлено");
+                                        _consecutiveConnectionFailures = 0;
+                                    }
+                                    else
+                                    {
+                                        logger.LogError("1090 Worker4: [МОНИТОР] НЕ УДАЛОСЬ восстановить соединение");
+                                        // Сбрасываем счетчик, чтобы попробовать снова через интервал
+                                        _consecutiveConnectionFailures = 0;
+                                    }
+                                }
+                            }
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            logger.LogInformation("1095 Worker4: [МОНИТОР] Получен сигнал остановки");
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogError(ex, "1100 Worker4: [МОНИТОР] Ошибка в цикле проверки: {Message}", ex.Message);
+                        }
+
+                        // Ждем следующий интервал проверки
+                        try
+                        {
+                            await Task.Delay(TimeSpan.FromSeconds(ConnectionCheckIntervalSeconds), token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            logger.LogInformation("1105 Worker4: [МОНИТОР] Остановка ожидания");
+                            break;
+                        }
+                    }
+
+                    logger.LogCritical("1110 Worker4: [МОНИТОР] ЗАВЕРШЕН");
+                }, token);
+            }
+        }
+
+        /// <summary>
+        /// Останавливает независимый монитор соединения
+        /// </summary>
+        private void StopIndependentConnectionMonitor()
+        {
+            lock (_monitorLock)
+            {
+                try
+                {
+                    if (_connectionMonitorCts != null)
+                    {
+                        _connectionMonitorCts.Cancel();
+                        _connectionMonitorCts.Dispose();
+                        _connectionMonitorCts = null;
+                    }
+
+                    if (_connectionMonitorTask != null && !_connectionMonitorTask.IsCompleted)
+                    {
+                        // Ждем завершения задачи с таймаутом
+                        _connectionMonitorTask.Wait(TimeSpan.FromSeconds(5));
+                    }
+                }
+                catch (AggregateException agEx)
+                {
+                    logger.LogWarning(agEx, "1115 Worker4: Ошибка при остановке монитора: {Message}", agEx.Message);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "1120 Worker4: Ошибка при остановке монитора: {Message}", ex.Message);
+                }
+                finally
+                {
+                    _connectionMonitorTask = null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Безопасная проверка соединения с логгированием
+        /// </summary>
+        private async Task<bool> CheckDatabaseConnectionSafeAsync()
+        {
+            try
+            {
+                string connectionString = options.Firebird_db_config;
+
+                // Запускаем проверку с таймаутом
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+
+                return await Task.Run(() =>
+                {
+                    try
+                    {
+                        using (var connection = new FbConnection(connectionString))
+                        {
+                            connection.Open();
+
+                            using (var command = new FbCommand("SELECT 1 FROM RDB$DATABASE", connection))
+                            {
+                                var result = command.ExecuteScalar();
+                                return result != null && Convert.ToInt32(result) == 1;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogTrace("Worker4: [МОНИТОР] Ошибка проверки: {Message}", ex.Message);
+                        return false;
+                    }
+                }, cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                logger.LogWarning("1125 Worker4: [МОНИТОР] Таймаут проверки соединения");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "1130 Worker4: [МОНИТОР] Критическая ошибка при проверке: {Message}", ex.Message);
+                return false;
+            }
+        }
+
+        #endregion
+
+        #region РАБОТА С ПОДПИСКОЙ
 
         private async Task<bool> ConnectToEventMonitor()
         {
@@ -186,8 +443,11 @@ namespace TS4
 
                 isConnected = true;
                 isSubscribed = true;
+                _consecutiveConnectionFailures = 0;
+                _consecutiveCheckFailures = 0;
+                _lastSuccessfulCheck = DateTime.Now;
                 logger.LogWarning("122 Worker4: Успешно подключен к FbRemoteEvent, всего на подключение {Ms} мс", connectSw.ElapsedMilliseconds);
-                
+
                 // Если run_now == true — пауза 4 сек, чтобы пик FB (Open событий) успел спасть до card_in_dev
                 if (options.run_now)
                 {
@@ -197,7 +457,7 @@ namespace TS4
                     await ExecuteCardInDevAsync("run_now", TimeSpan.FromSeconds(30));
                     logger.LogInformation("128 Worker4: run_now card_in_dev завершён");
                 }
-                
+
                 // Запускаем таймер после успешного подключения (или после запуска при run_now)
                 RestartTimeoutTimer();
                 return true;
@@ -224,30 +484,29 @@ namespace TS4
 
         private void OnRemoteEventCounts(object? sender, FbRemoteEventCountsEventArgs e)
         {
-
-            if (!isConnected || !isSubscribed)
+            if (!isConnected || !isSubscribed || _isShuttingDown)
             {
                 logger.LogWarning("Worker4: Получено событие, но подписка неактивна. Игнорируем.");
 
-                // Попытка восстановления при получении события
-                _ = Task.Run(async () =>
+                if (!_isShuttingDown)
                 {
-                    try
+                    _ = Task.Run(async () =>
                     {
-                        await ReconnectSubscriptionAsync();
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogError(ex, "Worker4: Ошибка при восстановлении после получения события: {Message}", LogHelper.Sanitize(ex.Message));
-                    }
-                });
+                        try
+                        {
+                            await ReconnectSubscriptionAsync();
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogError(ex, "Worker4: Ошибка при восстановлении после получения события: {Message}", LogHelper.Sanitize(ex.Message));
+                        }
+                    });
+                }
 
                 return;
             }
 
             // Запускаем обработку асинхронно, чтобы не блокировать поток события Firebird.
-            // При получении события всегда: останавливаем таймер, запускаем card_in_dev.
-            // В card_in_dev потоки создаются только для устройств, для которых ещё нет потока (_devicesInProgress).
             _ = Task.Run(async () =>
             {
                 try
@@ -272,32 +531,7 @@ namespace TS4
                     // После окончания обработки карт — заново запускаем таймер (следующий запуск через timeout при отсутствии событий)
                     RestartTimeoutTimer();
 
-                    if (remoteEvent != null && isConnected)
-                    {
-                        // Используем lock для предотвращения одновременного вызова QueueEvents
-                        lock (subscriptionLock) // или можно создать отдельный lock объект
-                        {
-                            try
-                            {
-                                // Проверяем, что подписка еще активна (опционально)
-                                if (isSubscribed)
-                                {
-                                    string[] eventsToMonitor = { "CARDINDEV_INSERT" };
-                                    remoteEvent.QueueEvents(eventsToMonitor);
-                                    logger.LogDebug("Worker4: Переподписка на события выполнена");
-                                }
-                            }
-                            catch (InvalidOperationException ex) when (ex.Message.Contains("already running"))
-                            {
-                                // Это нормально - события уже запущены
-                                logger.LogDebug("Worker4: События уже запущены, переподписка не требуется");
-                            }
-                            catch (Exception ex)
-                            {
-                                logger.LogWarning(ex, "Worker4: Ошибка при переподписке: {Message}", LogHelper.Sanitize(ex.Message));
-                            }
-                        }
-                    }
+                    logger.LogDebug("Worker4: Обработка события завершена");
                 }
                 catch (Exception ex)
                 {
@@ -306,37 +540,185 @@ namespace TS4
             });
         }
 
-        public override async Task StopAsync(CancellationToken cancellationToken)
+        /// <summary>
+        /// Проверяет статус подписки безопасно
+        /// </summary>
+        private bool CheckSubscriptionStatusSafe()
         {
-            logger.LogInformation("204 Worker4: Остановка мониторинга событий");
+            // Не проверяем при завершении работы
+            if (_isShuttingDown)
+            {
+                logger.LogDebug("Worker4: Пропуск проверки подписки - сервис завершается");
+                return false;
+            }
+
+            // Если много ошибок подряд - увеличиваем интервал
+            if (_consecutiveCheckFailures > 3)
+            {
+                logger.LogWarning("Worker4: Слишком много ошибок проверки ({Failures}), временно отключаем проверки",
+                    _consecutiveCheckFailures);
+                return isSubscribed;
+            }
+
+            lock (subscriptionLock)
+            {
+                try
+                {
+                    if (remoteEvent == null || !isConnected)
+                    {
+                        logger.LogDebug("Worker4: Проверка подписки - remoteEvent={RemoteEvent}, isConnected={Connected}",
+                            remoteEvent != null, isConnected);
+                        isSubscribed = false;
+                        return false;
+                    }
+
+                    string[] testEvents = { "CARDINDEV_INSERT" };
+
+                    try
+                    {
+                        remoteEvent.QueueEvents(testEvents);
+                        isSubscribed = true;
+                        logger.LogDebug("Worker4: Проверка подписки - подписка активна");
+                        return true;
+                    }
+                    catch (InvalidOperationException ex) when (ex.Message.Contains("already running") || ex.Message.Contains("Events are already running"))
+                    {
+                        // Это нормально - подписка активна
+                        isSubscribed = true;
+                        logger.LogDebug("Worker4: Проверка подписки - подписка активна (события уже запущены)");
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _consecutiveCheckFailures++;
+                    logger.LogWarning(ex, "Worker4: Ошибка при проверке подписки (попытка {Attempt}): {Message}",
+                        _consecutiveCheckFailures, ex.Message);
+                    isSubscribed = false;
+                    return false;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Проверка подписки из таймера
+        /// </summary>
+        private async Task CheckAndReconnectSubscriptionSafeAsync()
+        {
+            // Не проверяем при завершении работы или активной обработке
+            if (_isShuttingDown || IsBusy)
+            {
+                logger.LogDebug("Worker4: Пропуск плановой проверки подписки (Shutdown={Shutdown}, Busy={Busy})",
+                    _isShuttingDown, IsBusy);
+                return;
+            }
 
             try
             {
-                lock (subscriptionLock)
+                if (isConnected)
                 {
-                    if (remoteEvent != null && isConnected)
+                    bool subscriptionActive = CheckSubscriptionStatusSafe();
+                    if (!subscriptionActive && _consecutiveCheckFailures >= 2)
                     {
-                        try
-                        {
-                            remoteEvent.CancelEvents();
-                            isSubscribed = false;
-                            logger.LogInformation("211 Worker4: Отключен от FbRemoteEvent");
-                        }
-                        catch (Exception ex)
-                        {
-                            logger.LogError(ex, "Worker4: Ошибка при отключении от событий: {Message}", LogHelper.Sanitize(ex.Message));
-                        }
+                        logger.LogWarning("Worker4: Плановая проверка: подписка неактивна ({Failures} ошибок), восстанавливаем...",
+                            _consecutiveCheckFailures);
+                        await ReconnectSubscriptionAsync();
                     }
-                    isConnected = false;
+                    else if (subscriptionActive)
+                    {
+                        _consecutiveCheckFailures = 0;
+                    }
                 }
             }
             catch (Exception ex)
             {
-                logger.LogError(ex, "216 Worker4: Ошибка при отключении: {Message}", LogHelper.Sanitize(ex.Message));
+                logger.LogError(ex, "Worker4: Ошибка при плановой проверке подписки: {Message}", ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Переподключение подписки с полным восстановлением
+        /// </summary>
+        private async Task<bool> ReconnectSubscriptionAsync()
+        {
+            lock (subscriptionLock)
+            {
+                logger.LogInformation("Worker4: Попытка восстановления подписки...");
+
+                try
+                {
+                    // Сначала отписываемся и освобождаем ресурсы
+                    if (remoteEvent != null)
+                    {
+                        try
+                        {
+                            remoteEvent.RemoteEventCounts -= OnRemoteEventCounts;
+                            remoteEvent.CancelEvents();
+                            remoteEvent.Dispose();
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogDebug("Worker4: Ошибка при очистке старого подключения: {Message}", ex.Message);
+                        }
+                        remoteEvent = null;
+                    }
+
+                    isConnected = false;
+                    isSubscribed = false;
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Worker4: Ошибка при очистке перед восстановлением: {Message}", ex.Message);
+                }
             }
 
-            await base.StopAsync(cancellationToken);
+            // Пытаемся переподключиться
+            int retryCount = 0;
+            int maxRetries = 3;
+
+            while (retryCount < maxRetries && !isSubscribed && !_isShuttingDown)
+            {
+                retryCount++;
+                logger.LogInformation($"Worker4: Попытка восстановления {retryCount}/{maxRetries}...");
+
+                try
+                {
+                    // Сначала проверяем, что БД доступна
+                    bool dbAvailable = await CheckDatabaseConnectionSafeAsync();
+
+                    if (!dbAvailable)
+                    {
+                        logger.LogWarning($"Worker4: База данных недоступна (попытка {retryCount}). Ожидание...");
+                        await Task.Delay(TimeSpan.FromSeconds(10 * retryCount));
+                        continue;
+                    }
+
+                    // Пытаемся подключиться к событиям
+                    bool connected = await ConnectToEventMonitor();
+                    if (connected)
+                    {
+                        logger.LogInformation("Worker4: Подписка успешно восстановлена");
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, $"Worker4: Ошибка при восстановлении подписки (попытка {retryCount}): {ex.Message}");
+                }
+
+                if (retryCount < maxRetries)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(5 * retryCount));
+                }
+            }
+
+            logger.LogError("Worker4: Не удалось восстановить подписку после {MaxRetries} попыток", maxRetries);
+            return false;
         }
+
+        #endregion
+
+        #region ОСНОВНАЯ ЛОГИКА
 
         private async Task ExecuteCardInDevAsync(string triggerContext, TimeSpan waitTimeout)
         {
@@ -391,7 +773,7 @@ namespace TS4
                 DateTime estimatedRunTime = DateTime.Now.Add(timeoutDuration);
                 string timeFormat = estimatedRunTime.ToString("HH:mm:ss");
                 double totalMinutes = timeoutDuration.TotalMinutes;
-                
+
                 logger.LogTrace("294 Worker4: Таймер запущен. Автоматический запуск через {TotalMin} минут при отсутствии событий. Время следующего запуска: {TimeFormat}", totalMinutes, timeFormat);
 
                 // Создаем новый таймер
@@ -403,9 +785,9 @@ namespace TS4
                     try
                     {
                         await Task.Delay(timeoutDuration, token);
-                        
+
                         // Если таймер не был отменен, значит не было новых событий - запускаем card_in_dev
-                        if (!token.IsCancellationRequested)
+                        if (!token.IsCancellationRequested && !_isShuttingDown)
                         {
                             logger.LogInformation("309 Worker4: Истек таймер ({TotalMin} мин). Запуск по таймауту.", timeoutDuration.TotalMinutes);
 
@@ -433,57 +815,6 @@ namespace TS4
             }
         }
 
-        public override void Dispose()
-        {
-            try
-            {
-                // Останавливаем таймер
-                lock (timeoutTimerLock)
-                {
-                    if (timeoutTimerCts != null)
-                    {
-                        timeoutTimerCts.Cancel();
-                        timeoutTimerCts.Dispose();
-                        timeoutTimerCts = null;
-                    }
-                }
-
-                if (remoteEvent != null)
-                {
-                    remoteEvent.RemoteEventCounts -= OnRemoteEventCounts;
-                    remoteEvent.Dispose();
-                }
-            }
-            catch (Exception ex)
-            {
-                logger?.LogError(ex, "391 Worker4: Ошибка при освобождении ресурсов: {Message}", ex.Message);
-            }
-
-            base.Dispose();
-        }
-
-
-        
-
-
-        /// <summary>Вычисляет время следующего запуска по таймауту из конфига (формат H:M:S).</summary>
-        private static DateTime GetNextRunTimeFromTimeout(string timeout)
-        {
-            try
-            {
-                var parts = timeout.Split(':').Select(p => p.Trim()).ToArray();
-                if (parts.Length != 3) return DateTime.Now.AddMinutes(5);
-                int h = int.Parse(parts[0]);
-                int m = int.Parse(parts[1]);
-                int s = int.Parse(parts[2]);
-                return DateTime.Now.Add(new TimeSpan(h, m, s));
-            }
-            catch { return DateTime.Now.AddMinutes(5); }
-        }
-
-        //1. Получить список контроллеров куда грузить карты GetListForLoad
-        //2. Для каждого устройства собрать параметры для запуска.
-        //3. Запустить Mainline в режиме async
         public async Task card_in_dev()
         {
             try
@@ -526,7 +857,6 @@ namespace TS4
                             Thread.Sleep(30000);
                             continue;
                         }
-                        // Не пробрасываем дальше — сервис не должен завершаться из-за Access
                         return;
                     }
                     catch (Exception accEx)
@@ -551,13 +881,12 @@ namespace TS4
                 var connectionStringBuilder = new FbConnectionStringBuilder(options.Firebird_db_config);
                 if (connectionStringBuilder.Charset != null && connectionStringBuilder.Charset.ToUpper() != "UTF8")
                     connectionStringBuilder.Charset = "UTF8";
-                // Максимальный размер пакета (Firebird: 512..32767) — меньше round-trip при GetListForLoad
                 const int packetSizeForLoad = 32767;
                 try
                 {
                     connectionStringBuilder.PacketSize = packetSizeForLoad;
                 }
-                catch { /* свойство недоступно — подменим в строке */ }
+                catch { }
                 string modifiedConnectionString = connectionStringBuilder.ToString();
                 if (modifiedConnectionString.IndexOf("Packet Size", StringComparison.OrdinalIgnoreCase) >= 0)
                     modifiedConnectionString = System.Text.RegularExpressions.Regex.Replace(modifiedConnectionString, @"Packet\s*Size\s*=\s*\d+", $"Packet Size={packetSizeForLoad}", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
@@ -588,8 +917,6 @@ namespace TS4
 
                     var tBuild = DateTime.Now;
 
-
-                    
                     var devs = Device.BuildFromAccessAndFirebird(table, loadList);
                     logger.LogWarning("540 card_in_dev: Построение списка DEV (Access+Firebird), мс={Ms:F0}, устройств={Count}", (DateTime.Now - tBuild).TotalMilliseconds, devs.Count);
 
@@ -681,155 +1008,110 @@ namespace TS4
                 throw;
             }
         }
-        //08.12.2025 - добавлен метод для проверки статуса подписки на события Firebird.
-        private bool CheckSubscriptionStatus()
-        {
-            lock (subscriptionLock)
-            {
-                try
-                {
-                    if (remoteEvent == null)
-                    {
-                        logger.LogDebug("Worker4: Проверка подписки - объект remoteEvent отсутствует");
-                        isSubscribed = false;
-                        return false;
-                    }
 
-                    if (!isConnected)
-                    {
-                        logger.LogDebug("Worker4: Проверка подписки - подключение к базе данных отсутствует (isConnected = false)");
-                        isSubscribed = false;
-                        return false;
-                    }
-
-                    // Активно проверяем состояние подписки, вызывая QueueEvents.
-                    // Если соединение событий разорвано, здесь возникнет исключение,
-                    // и мы пометим подписку как неактивную, чтобы запустить восстановление.
-                    string[] testEvents = { "CARDINDEV_INSERT" };
-                    remoteEvent.QueueEvents(testEvents);
-
-                    isSubscribed = true;
-                    logger.LogDebug("Worker4: Проверка подписки - подписка активна (успешный QueueEvents)");
-                    return true;
-                }
-                catch (InvalidOperationException ex)
-                {
-                    // Если события уже запущены, это означает, что подписка активна и работает нормально
-                    if (ex.Message.Contains("already running") || ex.Message.Contains("Events are already running"))
-                    {
-                        isSubscribed = true;
-                        logger.LogDebug("Worker4: Проверка подписки - подписка активна (события уже запущены)");
-                        return true;
-                    }
-                    // Для других InvalidOperationException считаем подписку неактивной
-                    logger.LogWarning(ex, "Worker4: Подписка неактивна (InvalidOperationException) при проверке: {Message}", ex.Message);
-                    isSubscribed = false;
-                    return false;
-                }
-                catch (FbException ex)
-                {
-                    logger.LogWarning(ex, "Worker4: Ошибка Firebird при проверке подписки: {Message}", ex.Message);
-                    isSubscribed = false;
-                    return false;
-                }
-                catch (Exception ex)
-                {
-                    logger.LogWarning(ex, "Worker4: Общая ошибка при проверке подписки: {Message}", ex.Message);
-                    isSubscribed = false;
-                    return false;
-                }
-            }
-        }
-
-        private async Task<bool> ReconnectSubscriptionAsync()
-        {
-            lock (subscriptionLock)
-            {
-                logger.LogInformation("Worker4: Попытка восстановления подписки...");
-
-                try
-                {
-                    // Сначала отписываемся и освобождаем ресурсы
-                    if (remoteEvent != null)
-                    {
-                        try
-                        {
-                            remoteEvent.RemoteEventCounts -= OnRemoteEventCounts;
-                            remoteEvent.CancelEvents();
-                            remoteEvent.Dispose();
-                        }
-                        catch (Exception ex)
-                        {
-                            logger.LogDebug("Worker4: Ошибка при очистке старого подключения: {Message}", ex.Message);
-                        }
-                        remoteEvent = null;
-                    }
-
-                    isConnected = false;
-                    isSubscribed = false;
-                }
-                catch (Exception ex)
-                {
-                    logger.LogError(ex, "Worker4: Ошибка при очистке перед восстановлением: {Message}", ex.Message);
-                }
-            }
-
-            // Пытаемся переподключиться
-            int retryCount = 0;
-            int maxRetries = 3;
-
-            while (retryCount < maxRetries && !isSubscribed)
-            {
-                retryCount++;
-                logger.LogInformation($"Worker4: Попытка восстановления {retryCount}/{maxRetries}...");
-
-                try
-                {
-                    bool connected = await ConnectToEventMonitor();
-                    if (connected)
-                    {
-                        logger.LogInformation("Worker4: Подписка успешно восстановлена");
-                        return true;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    logger.LogError(ex, $"Worker4: Ошибка при восстановлении подписки (попытка {retryCount}): {ex.Message}");
-                }
-
-                if (retryCount < maxRetries)
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(5 * retryCount)); // Увеличиваем задержку
-                }
-            }
-
-            logger.LogError("Worker4: Не удалось восстановить подписку после {MaxRetries} попыток", maxRetries);
-            return false;
-        }
-
-        private async Task CheckAndReconnectSubscriptionAsync()
+        /// <summary>Вычисляет время следующего запуска по таймауту из конфига (формат H:M:S).</summary>
+        private static DateTime GetNextRunTimeFromTimeout(string timeout)
         {
             try
             {
-                if (isConnected)
+                var parts = timeout.Split(':').Select(p => p.Trim()).ToArray();
+                if (parts.Length != 3) return DateTime.Now.AddMinutes(5);
+                int h = int.Parse(parts[0]);
+                int m = int.Parse(parts[1]);
+                int s = int.Parse(parts[2]);
+                return DateTime.Now.Add(new TimeSpan(h, m, s));
+            }
+            catch { return DateTime.Now.AddMinutes(5); }
+        }
+
+        #endregion
+
+        #region ОСТАНОВКА И ОСВОБОЖДЕНИЕ РЕСУРСОВ
+
+        public override async Task StopAsync(CancellationToken cancellationToken)
+        {
+            logger.LogInformation("204 Worker4: Остановка мониторинга событий");
+            _isShuttingDown = true;
+
+            // ОСТАНАВЛИВАЕМ НЕЗАВИСИМЫЙ МОНИТОР
+            StopIndependentConnectionMonitor();
+
+            // Останавливаем таймер
+            lock (timeoutTimerLock)
+            {
+                if (timeoutTimerCts != null)
                 {
-                    bool subscriptionActive = CheckSubscriptionStatus();
-                    if (!subscriptionActive)
+                    timeoutTimerCts.Cancel();
+                    timeoutTimerCts.Dispose();
+                    timeoutTimerCts = null;
+                }
+            }
+
+            lock (subscriptionLock)
+            {
+                if (remoteEvent != null)
+                {
+                    try
                     {
-                        logger.LogWarning("Worker4: Проверка подписки: подписка неактивна, восстанавливаем...");
-                        await ReconnectSubscriptionAsync();
+                        remoteEvent.RemoteEventCounts -= OnRemoteEventCounts;
+                        remoteEvent.CancelEvents();
+                        remoteEvent.Dispose();
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        logger.LogDebug("Worker4: Проверка подписки: подписка активна");
+                        logger.LogError(ex, "Worker4: Ошибка при отключении от событий: {Message}", LogHelper.Sanitize(ex.Message));
                     }
+                    finally
+                    {
+                        remoteEvent = null;
+                    }
+                }
+                isConnected = false;
+                isSubscribed = false;
+            }
+
+            logger.LogInformation("211 Worker4: Отключен от FbRemoteEvent");
+
+            // Даем время на завершение всех потоков
+            await Task.Delay(1000, cancellationToken);
+
+            await base.StopAsync(cancellationToken);
+        }
+
+        public override void Dispose()
+        {
+            try
+            {
+                _isShuttingDown = true;
+
+                // ОСТАНАВЛИВАЕМ НЕЗАВИСИМЫЙ МОНИТОР
+                StopIndependentConnectionMonitor();
+
+                // Останавливаем таймер
+                lock (timeoutTimerLock)
+                {
+                    if (timeoutTimerCts != null)
+                    {
+                        timeoutTimerCts.Cancel();
+                        timeoutTimerCts.Dispose();
+                        timeoutTimerCts = null;
+                    }
+                }
+
+                if (remoteEvent != null)
+                {
+                    remoteEvent.RemoteEventCounts -= OnRemoteEventCounts;
+                    remoteEvent.Dispose();
                 }
             }
             catch (Exception ex)
             {
-                logger.LogError(ex, "Worker4: Ошибка при проверке подписки: {Message}", ex.Message);
+                logger?.LogError(ex, "391 Worker4: Ошибка при освобождении ресурсов: {Message}", ex.Message);
             }
+
+            base.Dispose();
         }
 
+        #endregion
     }
 }
