@@ -2,14 +2,19 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
 
 namespace TS4
 {
-    public class COM
+    public class COM : IDisposable
     {
         dynamic a;
+
+        // P5: после таймаута вызов внутри драйвера продолжает выполняться, поэтому такой
+        // объект нельзя ни использовать повторно, ни освобождать — только «бросить».
+        private volatile bool _abandoned;
 
         //public bool isTest = false;
         private readonly bool isTest;
@@ -50,7 +55,11 @@ namespace TS4
 
         public string ComandExecute(string comand)
         {
-            Console.WriteLine("50", isTest);
+            if (_abandoned)
+            {
+                // Объект «брошен» после таймаута — обращаться к нему нельзя (см. Abandon).
+                return "ERR TIMEOUT";
+            }
             if (isTest)
             {
                 Console.WriteLine("53 mode isTest is TRUE");
@@ -59,8 +68,12 @@ namespace TS4
             var task = Task.Run(() => (string)a.Execute(comand));
             if (task.Wait(TimeSpan.FromSeconds(driverTimeoutSeconds)))
                 return task.Result ?? "";
-            string raw = GetRawUdpResponseOrFallback(null);
-            return string.IsNullOrWhiteSpace(raw) ? "ERR TIMEOUT" : "ERR TIMEOUT " + raw;
+
+            // Таймаут драйвера: вызов внутри COM-объекта ещё выполняется. Повторный вызов
+            // (и даже чтение свойств) из другого потока даёт AccessViolationException,
+            // который в .NET не перехватывается и роняет процесс.
+            Abandon();
+            return "ERR TIMEOUT";
         }
 
 
@@ -79,13 +92,16 @@ namespace TS4
         {
             if (isTest)
                 return (true, "Yes");
+            if (_abandoned)
+                return (false, "ERR TIMEOUT");
             try
             {
                 var statusTask = Task.Run(() => (string)a.Execute(@"ReportStatus"));
                 if (!statusTask.Wait(TimeSpan.FromSeconds(driverTimeoutSeconds)))
                 {
-                    string rawTimeout = GetRawUdpResponseOrFallback(null);
-                    return (false, string.IsNullOrWhiteSpace(rawTimeout) ? "ERR TIMEOUT" : "ERR TIMEOUT " + rawTimeout);
+                    // Тот же риск, что и в ComandExecute: объект больше не трогаем.
+                    Abandon();
+                    return (false, "ERR TIMEOUT");
                 }
                 string response = statusTask.Result ?? "";
                 if (string.IsNullOrEmpty(response))
@@ -173,7 +189,36 @@ namespace TS4
         /// <summary>Возвращает последний сырой ответ драйвера/контроллера по UDP (для логирования при ошибках).</summary>
         public string GetLastDriverResponse()
         {
+            if (_abandoned) return "ERR TIMEOUT";
             return GetRawUdpResponseOrFallback(null);
+        }
+
+        /// <summary>
+        /// Помечает COM-объект как непригодный после таймаута вызова. Объект больше не используется
+        /// и не освобождается (внутри него ещё выполняется вызов), а GC не даёт его собрать.
+        /// </summary>
+        private void Abandon()
+        {
+            if (_abandoned) return;
+            _abandoned = true;
+            try
+            {
+                // Отдельно удерживать объект не нужно: пока брошенный вызов выполняется,
+                // его задача держит ссылку на этот объект, поэтому GC не освободит COM
+                // «на ходу»; после завершения вызова объект спокойно соберётся.
+                Serilog.Log.Warning("COM: вызов драйвера не уложился в {Timeout} сек — объект больше не используется, будет создан новый", driverTimeoutSeconds);
+            }
+            catch { }
+        }
+
+        /// <summary>Освобождает COM-объект. Брошенный объект не освобождается (в нём может идти вызов).</summary>
+        public void Dispose()
+        {
+            if (_abandoned) return;
+            object? obj = a;
+            a = null!;
+            if (obj == null) return;
+            try { Marshal.FinalReleaseComObject(obj); } catch { }
         }
     }
 }

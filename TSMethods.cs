@@ -145,7 +145,8 @@ namespace TS4
 		try
 		{
 			var tCom = DateTime.Now;
-			COM com = new COM(dev.driver, options);
+			// P5: COM освобождается детерминированно (Marshal.FinalReleaseComObject), а не сборщиком мусора
+			using var com = new COM(dev.driver, options);
 			com.SetupString(dev.ip);
 			var (reportOk, reportMessage) = com.ReportStatusWithMessage();
 			if (reportOk)

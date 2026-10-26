@@ -75,6 +75,11 @@ namespace TS4
             const string timeFmt = "HH:mm:ss.fff";
             logger.LogCritical("50 [время запуска {Time}] Worker4 запущен - мониторинг событий Firebird через FbRemoteEvent", DateTime.Now.ToString(timeFmt));
             logger.LogCritical("51 Версия программы: {Version}", version);
+            // P3: фактический режим работы виден в логе при любом уровне логирования
+            logger.LogCritical("51a Режим работы: isTest={IsTest}, mode={Mode}, интервал между циклами={Interval}",
+                options.IsTest,
+                string.IsNullOrWhiteSpace(options.mode) ? "async" : options.mode,
+                WorkerTime.ParseOrDefault(options.timeout));
 
             try
             {
@@ -750,24 +755,13 @@ namespace TS4
                     timeoutTimerCts.Dispose();
                 }
 
-                // Парсим timeout из конфигурации (формат "H:M:S" или "0:01:0" с ведущими нулями)
-                var timeoutParts = options.timeout.Split(':').Select(p => p.Trim()).ToArray();
-                if (timeoutParts.Length != 3)
+                // P8: разбор без исключений — отсутствие или опечатка в timeout не должны
+                // приводить к исключению внутри блокировки и остановке авто-запуска
+                if (!WorkerTime.IsValid(options.timeout))
                 {
-                    logger.LogWarning("274 Worker4: Неверный формат timeout в конфигурации. Используется значение по умолчанию: 5 минут");
-                    timeoutParts = new[] { "0", "5", "0" };
+                    logger.LogWarning("274 Worker4: Неверный формат timeout в конфигурации ({Value}). Используется значение по умолчанию: 5 минут", options.timeout);
                 }
-
-                int hours = int.Parse(timeoutParts[0]);
-                int minutes = int.Parse(timeoutParts[1]);
-                int seconds = int.Parse(timeoutParts[2]);
-                TimeSpan timeoutDuration = new TimeSpan(hours, minutes, seconds);
-
-                if (timeoutDuration.TotalSeconds <= 0)
-                {
-                    logger.LogWarning("285 Worker4: Timeout должен быть больше 0. Используется значение по умолчанию: 5 минут");
-                    timeoutDuration = TimeSpan.FromMinutes(5);
-                }
+                TimeSpan timeoutDuration = WorkerTime.ParseOrDefault(options.timeout);
 
                 // Вычисляем ориентировочное время запуска
                 DateTime estimatedRunTime = DateTime.Now.Add(timeoutDuration);
@@ -823,6 +817,26 @@ namespace TS4
                 var t0 = DateTime.Now;
                 logger.LogWarning("500 [время запуска {Time}] card_in_dev: Начало обработки карт (до MainLine), время выполнения: 0 мс", t0.ToString(timeFmt));
 
+                // Путь к MDB и TEMP проверяем заранее: иначе Jet отвечает неинформативной
+                // «Неопознанная ошибка» (0x80004005), по которой причину не найти.
+                string? mdbPath = DBAccess.GetDataSourcePath(options.Access_db_config);
+                if (string.IsNullOrWhiteSpace(mdbPath))
+                {
+                    logger.LogCritical("504 card_in_dev: в Access_db_config не задан путь к MDB (Data Source) — карты не будут обработаны");
+                    return;
+                }
+                if (!File.Exists(mdbPath))
+                {
+                    logger.LogCritical("504 card_in_dev: файл Access не найден: {Path}. Проверьте Access_db_config в appsettings.json", mdbPath);
+                    return;
+                }
+                string? tempIssue = DBAccess.CheckTempFolder();
+                if (tempIssue != null)
+                {
+                    logger.LogCritical("504 card_in_dev: {Issue} — Jet не сможет открыть Access (симптом «Неопознанная ошибка», 0x80004005)", tempIssue);
+                    return;
+                }
+
                 DataTable? table = null;
                 const int accessRetries = 2;
                 int attempt = 0;
@@ -839,6 +853,21 @@ namespace TS4
                             accCon.Open();
                             table = DBAccess.GetDevice(accCon);
                         }
+                        // Список устройств, найденных в Access (подробно — уровень Trace)
+                        if (table != null && logger.IsEnabled(LogLevel.Trace))
+                        {
+                            logger.LogTrace("508 card_in_dev: устройства из Access, найдено {Count}", table.Rows.Count);
+                            for (int i = 0; i < table.Rows.Count; i++)
+                            {
+                                DataRow row = table.Rows[i];
+                                logger.LogTrace("508 card_in_dev: устройство #{Num}: ID={Id}, Name={Name}, IP={Ip}, Driver={Driver}",
+                                    i + 1,
+                                    row["ID"]?.ToString(),
+                                    row["Name"]?.ToString(),
+                                    row["ConnectionString"]?.ToString(),
+                                    row["Driver"]?.ToString());
+                            }
+                        }
                         logger.LogWarning("510 [время запуска {Time}] card_in_dev: Чтение Access (устройства) завершено, время выполнения: {Ms:F0} мс", DateTime.Now.ToString(timeFmt), (DateTime.Now - tAcc).TotalMilliseconds);
                         break;
                     }
@@ -850,7 +879,7 @@ namespace TS4
                     catch (System.Data.OleDb.OleDbException oleEx)
                     {
                         bool resourceError = (oleEx.Message ?? "").Contains("Недостаточно системных ресурсов", StringComparison.OrdinalIgnoreCase);
-                        logger.LogError(oleEx, "428 Worker4: Ошибка Access DB: {Message}", oleEx.Message);
+                        logger.LogError(oleEx, "428 Worker4: Ошибка Access DB ({Path}): {Message}. TEMP={Temp}", mdbPath, oleEx.Message, Path.GetTempPath());
                         if (resourceError && attempt <= accessRetries)
                         {
                             logger.LogWarning("Worker4: Повтор через 30 сек (попытка {Attempt}/{Total})", attempt, accessRetries + 1);
@@ -937,7 +966,7 @@ namespace TS4
                         logger.LogInformation("551 card_in_dev: Устройство #{Num} Name={Name} Id={Id} IP={Ip}", i + 1, dev.controllerName, dev.id, dev.ip);
                     }
 
-                    if (options.mode.ToLower() == "async")
+                    if (string.Equals(options.mode, "async", StringComparison.OrdinalIgnoreCase))
                     {
                         const int staggerMs = 450;
                         for (int i = 0; i < devs.Count; i++)
@@ -975,7 +1004,9 @@ namespace TS4
                                 }
                             })
                             {
-                                Name = $"Worker4-{devLocal.controllerName}-{devLocal.ip}"
+                                Name = $"Worker4-{devLocal.controllerName}-{devLocal.ip}",
+                                // P7: фоновый поток не мешает процессу завершиться, если контроллер завис
+                                IsBackground = true
                             };
 
                             thread.Start();

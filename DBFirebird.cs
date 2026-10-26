@@ -172,19 +172,22 @@ namespace TS4
         public static bool UpdateIdxCard(FbConnection con, DataRow row, string result, bool s_e)
         {
             int idCardInDev = Convert.ToInt32(row["id_cardindev"]);
-            string id_cardindev = "";
-            if (s_e)
-            {
-                id_cardindev = ",cdx.id_cardindev=null";
-            }
-            string sql = $@"update cardidx cdx
-                set cdx.load_time='now',
-                cdx.load_result='{result.Substring(0, Math.Min(result.Length, 100))}'
-                {id_cardindev}
-                where cdx.id_cardindev={idCardInDev}";
+
+            // P4: значение передаётся параметром. Раньше ответ контроллера подставлялся в SQL
+            // как есть: апостроф в ответе ломал запрос (карта навсегда оставалась в очереди),
+            // плюс это была точка SQL-инъекции из данных устройства.
+            string loadResult = result ?? "";
+            if (loadResult.Length > MaxLoadResultLength)
+                loadResult = loadResult.Substring(0, MaxLoadResultLength);
+
+            string sql = "update cardidx cdx set cdx.load_time='now', cdx.load_result=@result"
+                       + (s_e ? ", cdx.id_cardindev=null" : "")
+                       + " where cdx.id_cardindev=@id_cardindev";
 
             using (var cmd = new FbCommand(sql, con))
             {
+                cmd.Parameters.AddWithValue("@result", loadResult);
+                cmd.Parameters.AddWithValue("@id_cardindev", idCardInDev);
                 int rowsAffected = cmd.ExecuteNonQuery();
                 return rowsAffected > 0;
             }

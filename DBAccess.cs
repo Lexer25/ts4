@@ -25,5 +25,49 @@ namespace TS4
             }
             return table;
         }
+
+        /// <summary>Извлекает путь к файлу базы (Data Source) из строки подключения OLE DB.</summary>
+        public static string? GetDataSourcePath(string? connectionString)
+        {
+            if (string.IsNullOrWhiteSpace(connectionString)) return null;
+
+            foreach (var part in connectionString.Split(';'))
+            {
+                int idx = part.IndexOf('=');
+                if (idx < 0) continue;
+
+                string key = part.Substring(0, idx).Trim();
+                if (!key.Equals("Data Source", StringComparison.OrdinalIgnoreCase)) continue;
+
+                string value = part.Substring(idx + 1).Trim().Trim('"');
+                return value.Length == 0 ? null : value;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Проверяет каталог временных файлов. Jet не открывает базу, если TEMP недоступен,
+        /// и возвращает при этом неинформативную «Неопознанная ошибка» (0x80004005).
+        /// Возвращает описание проблемы или null, если всё в порядке.
+        /// </summary>
+        public static string? CheckTempFolder()
+        {
+            string probe = "";
+            try
+            {
+                string temp = Path.GetTempPath();
+                if (string.IsNullOrWhiteSpace(temp) || !Directory.Exists(temp))
+                    return $"каталог временных файлов не найден: '{temp}'";
+
+                probe = Path.Combine(temp, $"ts4_temp_probe_{Guid.NewGuid():N}.tmp");
+                using (new FileStream(probe, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1, FileOptions.DeleteOnClose)) { }
+                return null;
+            }
+            catch (Exception ex)
+            {
+                try { if (probe.Length > 0) File.Delete(probe); } catch { }
+                return $"каталог временных файлов недоступен для записи: {ex.Message}";
+            }
+        }
     }
 }

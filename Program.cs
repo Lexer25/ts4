@@ -8,7 +8,8 @@ using Newtonsoft.Json.Linq;
 using Serilog;
 using Serilog.Core;
 
-// Версия из .csproj (свойство Version) — выводится при старте (Worker4, лог "51 Версия программы")
+// Версия из .csproj (свойство Version) — выводится при старте: первая строка консоли,
+// стартовая строка в логе и Worker4 ("51 Версия программы"). Менять только в csproj.
 var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "Unknown";
 
 // Только один экземпляр программы (консоль и служба видят один и тот же Mutex)
@@ -128,7 +129,7 @@ void EnsureFallbackLogger(string reason, string? appsettingsUsedPath = null, int
 // Таймер для логирования этапов запуска (пик нагрузки на FB ~5 сек)
 var startupSw = Stopwatch.StartNew();
 var timeFmt = "HH:mm:ss.fff";
-Console.WriteLine("Старт программы. Время запуска: {0}. Логирование этапов включено.", DateTime.Now.ToString(timeFmt));
+Console.WriteLine("Старт программы. Версия {0}. Время запуска: {1}. Логирование этапов включено.", version, DateTime.Now.ToString(timeFmt));
 
 // Режим службы Windows: не блокировать старт на проверках (иначе ошибка 1053 — таймаут запуска)
 bool isWindowsService = !Environment.UserInteractive;
@@ -235,6 +236,70 @@ while (true)
         continue;
     }
 }
+
+// P2/P3/P8: параметры Service проверяем сразу после загрузки конфигурации и явно пишем в лог,
+// с чем стартуем. Раньше отсутствие timeout/mode или 64-битная сборка с Jet-драйвером
+// приводили к невнятному падению либо к тихой неработоспособности.
+void LogServiceSettings(IConfiguration config)
+{
+    var svc = config.GetSection("Service").Get<WorkerOptions>() ?? new WorkerOptions();
+    TimeSpan interval = WorkerTime.ParseOrDefault(svc.timeout);
+    string mode = string.IsNullOrWhiteSpace(svc.mode) ? "async" : svc.mode;
+
+    if (!WorkerTime.IsValid(svc.timeout))
+    {
+        Log.Fatal("P8 timeout в appsettings.json отсутствует или имеет неверный формат ({Value}). Используется {Minutes} мин.",
+            svc.timeout, interval.TotalMinutes);
+        Console.WriteLine($"timeout в appsettings.json отсутствует или неверен (\"{svc.timeout}\") — используется {interval.TotalMinutes:0} мин.");
+    }
+
+    if (string.IsNullOrWhiteSpace(svc.mode))
+    {
+        Log.Fatal("P8 mode в appsettings.json не задан. Используется async.");
+        Console.WriteLine("mode не задан — используется async.");
+    }
+
+    Log.Fatal("Версия программы: {Version}. Режим работы: isTest={IsTest}, mode={Mode}, интервал между циклами={Interval}", version, svc.IsTest, mode, interval);
+    Console.WriteLine($"Версия программы: {version}. Режим работы: isTest={svc.IsTest}, mode={mode}, интервал между циклами={interval}");
+
+    if (svc.IsTest)
+    {
+        Log.Fatal("P3 ВНИМАНИЕ: isTest=true — команды контроллерам НЕ отправляются, драйвер отвечает ERR, карты остаются в очереди");
+        Console.WriteLine("ВНИМАНИЕ: isTest=true — команды контроллерам НЕ отправляются!");
+    }
+
+    // P2: Microsoft.Jet.OLEDB.4.0 существует только в 32-битном виде — x64-процесс не откроет Access
+    bool usesJet = (svc.Access_db_config ?? "").IndexOf("JET", StringComparison.OrdinalIgnoreCase) >= 0;
+    if (Environment.Is64BitProcess && usesJet)
+    {
+        Log.Fatal("P2 Процесс 64-битный, а Microsoft.Jet.OLEDB.4.0 — только 32-битный: Access (TS2.mdb) читаться не будет. Нужна x86-сборка.");
+        Console.WriteLine("ВНИМАНИЕ: 64-битный процесс + Jet OLEDB 4.0 (только 32 бита) — Access недоступен, нужна x86-сборка.");
+    }
+
+    // Access проверяем при старте: в режиме службы иначе проблема видна только по
+    // неинформативной «Неопознанная ошибка» из card_in_dev
+    string? accessPath = DBAccess.GetDataSourcePath(svc.Access_db_config);
+    if (string.IsNullOrWhiteSpace(accessPath))
+    {
+        Log.Fatal("P1 Access_db_config: не задан путь к MDB (Data Source) — Access читаться не будет");
+        Console.WriteLine("Access_db_config: не задан путь к MDB.");
+    }
+    else if (!File.Exists(accessPath))
+    {
+        Log.Fatal("P1 Файл Access не найден: {Path} — карты не будут обработаны", accessPath);
+        Console.WriteLine($"Файл Access не найден: {accessPath}");
+    }
+
+    string? tempIssue = DBAccess.CheckTempFolder();
+    if (tempIssue != null)
+    {
+        Log.Fatal("P1 {Issue} — Jet не откроет Access (симптом «Неопознанная ошибка», 0x80004005)", tempIssue);
+        Console.WriteLine($"{tempIssue} — Jet не откроет Access.");
+    }
+}
+
+EnsureConfigLogger(configuration);
+LogServiceSettings(configuration);
 
 // Извлечь путь к MDB из строки подключения Access
 static string? GetMdbPathFromAccessConfig(string? accessConfig)
@@ -426,7 +491,7 @@ Console.CancelKeyPress += (sender, e) =>
 Log.Warning("200 [время запуска {Time}] [мс={ElapsedMs}] Проверка объектов БД (процедура, триггер): начало", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);
 try
 {
-    WorkerOptions options = configuration.GetSection("Service").Get<WorkerOptions>();
+    WorkerOptions options = configuration.GetSection("Service").Get<WorkerOptions>() ?? new WorkerOptions();
 
     if (options != null && !string.IsNullOrEmpty(options.Firebird_db_config))
     {
@@ -491,7 +556,7 @@ try
         .ConfigureServices((context, services) =>
         {
             IConfiguration configuration = context.Configuration;
-            WorkerOptions options = configuration.GetSection("Service").Get<WorkerOptions>();
+            WorkerOptions options = configuration.GetSection("Service").Get<WorkerOptions>() ?? new WorkerOptions();
 
             services.AddSingleton(options);
             services.AddSingleton(version);
@@ -527,26 +592,13 @@ try
         .UseWindowsService()
         .Build();
 
-    // Путь к exe (ProcessPath — .exe; при dotnet run или Location может быть .dll)
-    string exePath = Environment.ProcessPath ?? Assembly.GetExecutingAssembly().Location;
-    if (string.IsNullOrEmpty(exePath) || exePath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
-        exePath = Path.Combine(exeDir, "TS4.exe");
-
     string header1 = "Begin log: open application log";
     string header2 = "Транспортный сервер TS4 для работы с контроллерами серии Artonit версия {Version}. Срок службы не ограничен. www.artonit.ru";
-    string header5 = "Регистрация службы";
-    string header6 = $"sc create TS4 binPath=\"{exePath}\" start=auto DisplayName=TS4 type=own";
-    string header7 = "sc description TS4 \"Транспортный сервер СКУД Артонит\"";
 
     Console.WriteLine(header1);
     Log.Fatal(header1);
     Console.WriteLine($"Транспортный сервер TS4 для работы с контроллерами серии Artonit версия {version}");
     Log.Fatal(header2, version);
-    Log.Fatal(header5);
-    Console.WriteLine(header6);
-    Log.Fatal(header6);
-    Console.WriteLine(header7);
-    Log.Fatal(header7);
 
     Log.Fatal("Старт программы. Время запуска: {Time}", DateTime.Now.ToString(timeFmt));
     Log.Warning("310 [время запуска {Time}] [мс={ElapsedMs}] Host: Build завершён", DateTime.Now.ToString(timeFmt), startupSw.ElapsedMilliseconds);

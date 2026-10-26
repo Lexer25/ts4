@@ -26,10 +26,10 @@ namespace TS4
             this.options = options;
             this.version = version;
             this.ts = ts;
-            var time = options.timeout.Split(':');
-            timeout = new TimeSpan(Int32.Parse(time[0]), Int32.Parse(time[1]), Int32.Parse(time[2]));
-            time = options.timeout.Split(':');
-            timestart = new TimeSpan(Int32.Parse(time[0]), Int32.Parse(time[1]), Int32.Parse(time[2]));
+            // P8: без исключений при отсутствии/опечатке в timeout. Раньше здесь падал
+            // конструктор, а вместе с ним и запуск всей службы (Worker — зависимость Worker4).
+            timeout = WorkerTime.ParseOrDefault(options.timeout);
+            timestart = timeout;
             var now = new TimeSpan(DateTime.Now.TimeOfDay.Hours, DateTime.Now.TimeOfDay.Minutes, DateTime.Now.TimeOfDay.Seconds);
             deltasleep = (options.run_now) ? TimeSpan.Zero :
                 (timestart >= now) ? timestart - now : timestart - now + new TimeSpan(1, 0, 0, 0);

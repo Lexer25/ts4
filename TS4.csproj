@@ -7,7 +7,10 @@
     <UserSecretsId>dotnet-TS4-54869e89-5562-4c18-85cf-84a78ae9ec5f</UserSecretsId>
     <DockerDefaultTargetOS>Windows</DockerDefaultTargetOS>
     <Platforms>AnyCPU;x86</Platforms>
-    <Version>1.0.3.8</Version>
+    <!-- P2: всегда 32-битная сборка. Провайдер Microsoft.Jet.OLEDB.4.0 существует только
+         в 32-битном виде, поэтому x64-процесс не может открыть Access (TS2.mdb). -->
+    <PlatformTarget>x86</PlatformTarget>
+    <Version>1.0.3.9</Version>
     <AssemblyVersion>$(Version)</AssemblyVersion>
     <FileVersion>$(Version)</FileVersion>
   </PropertyGroup>

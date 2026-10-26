@@ -20,24 +20,43 @@ namespace TS4
 
 		public void Emit(LogEvent logEvent)
 		{
-			lock (_lock)
+			// P6: сбой записи в файл (нет папки, нет прав, диск занят, файл заблокирован)
+			// не должен выбрасываться наружу: исключение из синка логов роняет процесс.
+			try
 			{
-				var today = DateTime.Now.Date;
-				if (_writer == null || today != _currentDate)
+				lock (_lock)
 				{
-					_writer?.Dispose();
-					_currentDate = today;
-					Directory.CreateDirectory(_folder);
-					string path = Path.Combine(_folder, $"TS4_{_currentDate:yyyy-MM-dd}.log");
-					_writer = new StreamWriter(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read), Encoding.UTF8)
+					var today = DateTime.Now.Date;
+					if (_writer == null || today != _currentDate)
 					{
-						AutoFlush = true
-					};
+						_writer?.Dispose();
+						_currentDate = today;
+						Directory.CreateDirectory(_folder);
+						string path = Path.Combine(_folder, $"TS4_{_currentDate:yyyy-MM-dd}.log");
+						_writer = new StreamWriter(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read), Encoding.UTF8)
+						{
+							AutoFlush = true
+						};
+					}
+					string line = Format(logEvent);
+					_writer.WriteLine(line);
+					if (logEvent.Exception != null)
+						_writer.WriteLine(logEvent.Exception.ToString());
 				}
-				string line = Format(logEvent);
-				_writer.WriteLine(line);
-				if (logEvent.Exception != null)
-					_writer.WriteLine(logEvent.Exception.ToString());
+			}
+			catch (Exception ex)
+			{
+				try
+				{
+					lock (_lock)
+					{
+						_writer?.Dispose();
+						_writer = null;
+					}
+				}
+				catch { }
+
+				Serilog.Debugging.SelfLog.WriteLine("DateRollingFileSink: не удалось записать лог: {0}", ex.Message);
 			}
 		}
 
